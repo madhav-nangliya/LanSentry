@@ -2,29 +2,100 @@
 
 {% block content %}
 
-<div class="table-container">
-    <h2>🚨 Alert Log</h2>
+<!-- Page Header -->
+<div class="page-header">
+  <div class="breadcrumb">NetWatch / <span>Alerts</span></div>
+  <h2>Alert Log</h2>
+  <p>Unknown or suspicious devices detected on your network</p>
+</div>
 
+<!-- Alerts Panel -->
+<div class="panel">
+
+  <div class="panel-header">
+    <div class="panel-title">
+      <div class="dot" style="background: var(--danger); box-shadow: 0 0 8px var(--danger);"></div>
+      Security Alerts
+    </div>
+    <div class="panel-actions">
+      <button class="btn btn-ghost" onclick="clearAlerts()">🗑️ Clear All</button>
+    </div>
+  </div>
+
+  <div id="alerts-container">
     {% if alerts %}
-    <table>
-        <tr>
-            <th>IP Address</th>
-            <th>Hostname</th>
-            <th>Message</th>
-        </tr>
-        {% for alert in alerts %}
-        <tr>
-            <td>{{ alert.ip }}</td>
-            <td>{{ alert.hostname }}</td>
-            <td style="color: #f87171;">{{ alert.message }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-
+      {% for alert in alerts %}
+      <div class="alert-item">
+  <div class="alert-icon-wrap">🚨</div>
+  <div class="alert-content">
+    <div class="alert-title">Unknown Device Detected</div>
+    <div class="alert-detail">IP: {{ alert.ip }} &nbsp;|&nbsp; {{ alert.hostname }}</div>
+    <div class="alert-detail" style="margin-top:3px; color:var(--danger);">{{ alert.message }}</div>
+  </div>
+  <!-- Block button directly from alerts page -->
+  <button class="btn" style="padding:6px 14px; font-size:12px; flex-shrink:0;
+    background:var(--danger-bg); color:var(--danger); border:1px solid var(--danger);"
+    onclick="blockFromAlert('{{ alert.ip }}')">
+    🚫 Block
+  </button>
+</div>
+      {% endfor %}
     {% else %}
-    <p style="color: #94a3b8;">✅ No alerts detected. Your network looks clean!</p>
+      <div class="no-alerts">
+        <div class="shield">🛡️</div>
+        <h3>All Clear!</h3>
+        <p>No suspicious activity detected.<br>Your network looks clean.</p>
+      </div>
     {% endif %}
+  </div>
+
+  <div class="panel-footer">
+    <div class="update-info">
+      <div class="live-dot"></div>
+      <span id="alerts-updated">Monitoring active</span>
+    </div>
+    <span class="next-scan">Auto-checks every 30s</span>
+  </div>
 
 </div>
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function blockFromAlert(ip) {
+    if (!confirm(`Block device ${ip}?`)) return;
+    fetch(`/api/block/${ip}`)
+      .then(r => r.json())
+      .then(result => {
+        if (result.success) {
+          showToast(`🚫 ${ip} blocked successfully!`, 'success');
+        } else {
+          showToast(`❌ Failed: ${result.message}`, 'error');
+        }
+      });
+  }
+  
+  function clearAlerts() {
+    document.getElementById('alerts-container').innerHTML = `
+      <div class="no-alerts">
+        <div class="shield">🛡️</div>
+        <h3>All Clear!</h3>
+        <p>No suspicious activity detected.<br>Your network looks clean.</p>
+      </div>
+    `;
+    showToast('Alert log cleared', 'success');
+  }
+
+  // Auto refresh alerts
+  setInterval(() => {
+    fetch('/api/alerts')
+      .then(r => r.json())
+      .then(alerts => {
+        const now = new Date();
+        document.getElementById('alerts-updated').textContent =
+          'Last checked: ' + now.toLocaleTimeString();
+      });
+  }, 30000);
+</script>
 {% endblock %}

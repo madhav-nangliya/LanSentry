@@ -1,26 +1,144 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Network Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NetWatch — Network Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 
-    <!-- Navigation Bar -->
-    <div class="navbar">
-    <h1>🛡️ Network Dashboard</h1>
-    <a href="/">Home</a>
-    <a href="/devices">Devices</a>
-    <a href="/alerts">Alerts</a>
-</div>
+  <!-- ── NAVBAR ── -->
+  <nav class="navbar">
 
-    <!-- Page Content Goes Here -->
-    <div class="container">
-        {% block content %}
-        {% endblock %}
+    <!-- Brand -->
+    <a class="navbar-brand" href="/">
+      <div class="logo-icon">🛡️</div>
+      <h1>Net<span>Watch</span></h1>
+    </a>
+
+    <!-- Desktop Nav Links -->
+    <ul class="nav-links">
+      <li><a href="/" id="nav-home">🏠 Home</a></li>
+      <li><a href="/devices" id="nav-devices">📡 Devices</a></li>
+      <li><a href="/alerts" id="nav-alerts">🚨 Alerts <span class="alert-badge" id="alert-count" style="display:none">0</span></a></li>
+    </ul>
+
+    <!-- Right Side -->
+    <div class="nav-right">
+      <div class="network-status">
+        <div class="status-dot"></div>
+        Network Active
+      </div>
+
+      <!-- Dark / Light Mode Toggle -->
+      <button class="theme-toggle" id="theme-toggle" title="Toggle dark/light mode">
+        <div class="toggle-knob" id="toggle-knob">🌙</div>
+      </button>
+
+      <!-- Hamburger for mobile -->
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span>
+        <span></span>
+        <span></span>
+      </button>
     </div>
+  </nav>
+
+  <!-- ── MOBILE NAV DRAWER ── -->
+  <div class="mobile-nav" id="mobile-nav">
+    <a href="/">🏠 Home</a>
+    <a href="/devices">📡 Devices</a>
+    <a href="/alerts">🚨 Alerts</a>
+  </div>
+
+  <!-- ── PAGE CONTENT ── -->
+  <div class="container">
+    {% block content %}{% endblock %}
+  </div>
+
+  <!-- ── TOAST CONTAINER ── -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- ── GLOBAL JAVASCRIPT ── -->
+  <script>
+    // ── Theme Toggle ──
+    const body = document.body;
+    const themeToggle = document.getElementById('theme-toggle');
+    const toggleKnob = document.getElementById('toggle-knob');
+
+    // Load saved theme
+    const savedTheme = localStorage.getItem('theme');
+    if (savedTheme === 'light') {
+      body.classList.add('light-mode');
+      toggleKnob.textContent = '☀️';
+    }
+
+    themeToggle.addEventListener('click', () => {
+      body.classList.toggle('light-mode');
+      const isLight = body.classList.contains('light-mode');
+      toggleKnob.textContent = isLight ? '☀️' : '🌙';
+      localStorage.setItem('theme', isLight ? 'light' : 'dark');
+    });
+
+    // ── Hamburger Menu ──
+    const hamburger = document.getElementById('hamburger');
+    const mobileNav = document.getElementById('mobile-nav');
+
+    hamburger.addEventListener('click', () => {
+      mobileNav.classList.toggle('open');
+    });
+
+    // Close mobile nav on link click
+    mobileNav.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', () => {
+        mobileNav.classList.remove('open');
+      });
+    });
+
+    // ── Highlight Active Nav Link ──
+    const path = window.location.pathname;
+    if (path === '/') document.getElementById('nav-home').classList.add('active');
+    if (path === '/devices') document.getElementById('nav-devices').classList.add('active');
+    if (path === '/alerts') document.getElementById('nav-alerts').classList.add('active');
+
+    // ── Toast Notification System ──
+    function showToast(message, type = 'info', duration = 3000) {
+      const container = document.getElementById('toast-container');
+      const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      toast.innerHTML = `<span>${icons[type]}</span><span>${message}</span>`;
+      container.appendChild(toast);
+
+      setTimeout(() => {
+        toast.style.animation = 'toastOut 0.3s ease forwards';
+        setTimeout(() => toast.remove(), 300);
+      }, duration);
+    }
+
+    // ── Fetch alert count for navbar badge ──
+    function updateAlertBadge() {
+      fetch('/api/alerts')
+        .then(r => r.json())
+        .then(alerts => {
+          const badge = document.getElementById('alert-count');
+          if (alerts.length > 0) {
+            badge.textContent = alerts.length;
+            badge.style.display = 'inline';
+          } else {
+            badge.style.display = 'none';
+          }
+        })
+        .catch(() => {});
+    }
+
+    updateAlertBadge();
+    setInterval(updateAlertBadge, 30000);
+  </script>
+
+  {% block scripts %}{% endblock %}
 
 </body>
 </html>

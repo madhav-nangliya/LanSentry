@@ -2,68 +2,298 @@
 
 {% block content %}
 
-<div class="table-container">
-    <h2>Connected Devices <span id="last-updated" style="font-size:13px; color:#94a3b8;"></span></h2>
-
-    <table>
-        <tr>
-            <th>IP Address</th>
-            <th>Hostname</th>
-            <th>MAC Address</th>
-            <th>Status</th>
-        </tr>
-        <tbody id="device-table-body">
-            {% for device in devices %}
-            <tr>
-                <td>{{ device.ip }}</td>
-                <td>{{ device.hostname }}</td>
-                <td>{{ device.mac }}</td>
-                <td><span class="badge badge-online">● Online</span></td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+<div class="page-header">
+  <div class="breadcrumb">NetWatch / <span>Devices</span></div>
+  <h2>Connected Devices</h2>
+  <p>All devices currently detected on your local network</p>
 </div>
 
-<!-- JavaScript for auto-refresh -->
+<div class="panel">
+  <div class="panel-header">
+    <div class="panel-title">
+      <div class="dot"></div>
+      Live Device List
+    </div>
+    <div class="panel-actions">
+      <div class="search-bar">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="search-input" placeholder="Search devices..." />
+      </div>
+      <button class="btn btn-primary" id="refresh-btn" onclick="manualRefresh()">
+        <span class="btn-icon">🔄</span> Scan Now
+      </button>
+    </div>
+  </div>
+
+  <!-- Scan Progress Bar -->
+  <div class="scan-progress" id="scan-progress">
+    <div class="progress-bar">
+      <div class="progress-fill"></div>
+    </div>
+    <div class="progress-text">Scanning network...</div>
+  </div>
+
+  <!-- Device Table -->
+  <div class="table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>IP Address</th>
+          <th>Hostname</th>
+          <th>MAC Address</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="device-table-body">
+
+        {% for device in devices %}
+        <tr>
+          <td class="td-mono" style="color: var(--text-muted);">{{ loop.index }}</td>
+          <td class="td-mono">{{ device.ip }}</td>
+
+          <!-- Hostname -->
+          <td class="td-hostname">
+            {{ device.hostname.replace('(You)', '').strip() }}
+            {% if device.is_me %}
+              <span class="you-badge">YOU</span>
+            {% endif %}
+          </td>
+
+          <td class="td-mono">{{ device.mac }}</td>
+
+          <!-- Status Badge -->
+          <td>
+            {% if device.blocked %}
+              <span class="badge badge-warning">
+                <span class="badge-dot"></span>Blocked
+              </span>
+            {% elif device.is_gateway %}
+              <span class="badge" style="background:rgba(255,165,2,0.1); color:var(--warning);
+                border:1px solid rgba(255,165,2,0.2);">
+                <span class="badge-dot" style="background:var(--warning);"></span>Gateway
+              </span>
+            {% else %}
+              <span class="badge badge-online">
+                <span class="badge-dot"></span>Online
+              </span>
+            {% endif %}
+          </td>
+
+          <!-- Action Button -->
+          <td>
+            {% if device.is_me or device.is_gateway %}
+              <span style="color: var(--text-muted); font-size: 12px;">🔒 Protected</span>
+            {% elif device.blocked %}
+              <button class="btn btn-outline"
+                style="padding: 5px 12px; font-size: 12px;"
+                onclick="unblockDevice('{{ device.ip }}')">
+                ✅ Unblock
+              </button>
+            {% else %}
+              <button class="btn"
+                style="padding: 5px 12px; font-size: 12px;
+                  background: var(--danger-bg); color: var(--danger);
+                  border: 1px solid var(--danger);"
+                onclick="blockDevice('{{ device.ip }}')">
+                🚫 Block
+              </button>
+            {% endif %}
+          </td>
+
+        </tr>
+        {% endfor %}
+
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Panel Footer -->
+  <div class="panel-footer">
+    <div class="update-info">
+      <div class="live-dot"></div>
+      <span id="last-updated">Just loaded</span>
+    </div>
+    <span class="next-scan" id="next-scan-text">Next auto-scan in 30s</span>
+  </div>
+
+</div>
+
+{% endblock %}
+
+
+{% block scripts %}
 <script>
-    // This function fetches fresh device data every 30 seconds
-    function refreshDevices() {
-        // Call our JSON API
-        fetch('/api/devices')
-            .then(response => response.json())
-            .then(devices => {
+  let countdown = 30;
+  let allDevices = [];
 
-                // Get the table body element
-                let tableBody = document.getElementById('device-table-body');
+  // ── Block a Device ──
+  function blockDevice(ip) {
+    if (!confirm(`Block device ${ip}?\n\nThis will cut off all network traffic from this device.`)) return;
 
-                // Clear existing rows
-                tableBody.innerHTML = '';
+    showToast(`Blocking ${ip}...`, 'info');
 
-                // Add a new row for each device
-                devices.forEach(device => {
-                    tableBody.innerHTML += `
-                        <tr>
-                            <td>${device.ip}</td>
-                            <td>${device.hostname}</td>
-                            <td>${device.mac}</td>
-                            <td><span class="badge badge-online">● Online</span></td>
-                        </tr>
-                    `;
-                });
+    fetch(`/api/block/${ip}`)
+      .then(r => r.json())
+      .then(result => {
+        if (result.success) {
+          showToast(`${ip} has been blocked!`, 'success');
+          refreshDevices();
+        } else {
+          showToast(`Failed: ${result.message}`, 'error');
+        }
+      })
+      .catch(() => showToast('Block request failed', 'error'));
+  }
 
-                // Update last refreshed time
-                let now = new Date();
-                document.getElementById('last-updated').textContent = 
-                    `Last updated: ${now.toLocaleTimeString()}`;
-            });
+  // ── Unblock a Device ──
+  function unblockDevice(ip) {
+    if (!confirm(`Unblock device ${ip}?\n\nThis will restore network access for this device.`)) return;
+
+    showToast(`Unblocking ${ip}...`, 'info');
+
+    fetch(`/api/unblock/${ip}`)
+      .then(r => r.json())
+      .then(result => {
+        if (result.success) {
+          showToast(`${ip} has been unblocked!`, 'success');
+          refreshDevices();
+        } else {
+          showToast(`Failed: ${result.message}`, 'error');
+        }
+      })
+      .catch(() => showToast('Unblock request failed', 'error'));
+  }
+
+  // ── Render Table (used by auto-refresh) ──
+  function renderTable(devices) {
+    const tbody = document.getElementById('device-table-body');
+
+    if (devices.length === 0) {
+      tbody.innerHTML = `
+        <tr><td colspan="6">
+          <div class="empty-state">
+            <div class="empty-icon">📡</div>
+            <p>No devices found on network</p>
+          </div>
+        </td></tr>`;
+      return;
     }
 
-    // Run immediately when page loads
-    refreshDevices();
+    tbody.innerHTML = '';
 
-    // Then run every 30 seconds automatically
-    setInterval(refreshDevices, 30000);
+    devices.forEach((device, index) => {
+      const isYou      = device.is_me;
+      const isGateway  = device.is_gateway;
+      const isBlocked  = device.blocked;
+      const isProtected = isYou || isGateway;
+
+      // Clean hostname — remove "(You)" label
+      const name = device.hostname.replace('(You)', '').trim();
+
+      // Status badge
+      const statusBadge = isBlocked
+        ? `<span class="badge badge-warning"><span class="badge-dot"></span>Blocked</span>`
+        : isGateway
+        ? `<span class="badge" style="background:rgba(255,165,2,0.1);color:var(--warning);
+             border:1px solid rgba(255,165,2,0.2);">
+             <span class="badge-dot" style="background:var(--warning);"></span>Gateway
+           </span>`
+        : `<span class="badge badge-online"><span class="badge-dot"></span>Online</span>`;
+
+      // Action button
+      const actionBtn = isProtected
+        ? `<span style="color:var(--text-muted);font-size:12px;">🔒 Protected</span>`
+        : isBlocked
+        ? `<button class="btn btn-outline" style="padding:5px 12px;font-size:12px;"
+             onclick="unblockDevice('${device.ip}')">✅ Unblock</button>`
+        : `<button class="btn" style="padding:5px 12px;font-size:12px;
+             background:var(--danger-bg);color:var(--danger);border:1px solid var(--danger);"
+             onclick="blockDevice('${device.ip}')">🚫 Block</button>`;
+
+      tbody.innerHTML += `
+        <tr>
+          <td class="td-mono" style="color:var(--text-muted);">${index + 1}</td>
+          <td class="td-mono">${device.ip}</td>
+          <td class="td-hostname">
+            ${name}
+            ${isYou ? '<span class="you-badge">YOU</span>' : ''}
+          </td>
+          <td class="td-mono">${device.mac}</td>
+          <td>${statusBadge}</td>
+          <td>${actionBtn}</td>
+        </tr>`;
+    });
+  }
+
+  // ── Refresh Devices from API ──
+  function refreshDevices(manual = false) {
+    const progress = document.getElementById('scan-progress');
+    const btn = document.getElementById('refresh-btn');
+
+    // Show scanning state
+    progress.classList.add('active');
+    btn.classList.add('spinning');
+    btn.innerHTML = '<span class="btn-icon">🔄</span> Scanning...';
+    btn.disabled = true;
+
+    fetch('/api/devices')
+      .then(r => r.json())
+      .then(devices => {
+        allDevices = devices;
+        renderTable(devices);
+
+        const now = new Date();
+        document.getElementById('last-updated').textContent =
+          'Updated at ' + now.toLocaleTimeString();
+
+        // Reset UI
+        progress.classList.remove('active');
+        btn.classList.remove('spinning');
+        btn.innerHTML = '<span class="btn-icon">🔄</span> Scan Now';
+        btn.disabled = false;
+        countdown = 30;
+
+        if (manual) showToast(`Found ${devices.length} devices`, 'success');
+      })
+      .catch(() => {
+        progress.classList.remove('active');
+        btn.classList.remove('spinning');
+        btn.innerHTML = '<span class="btn-icon">🔄</span> Scan Now';
+        btn.disabled = false;
+        showToast('Scan failed. Check connection.', 'error');
+      });
+  }
+
+  // ── Live Search Filter ──
+  document.getElementById('search-input').addEventListener('input', function() {
+    const query = this.value.toLowerCase();
+    const filtered = allDevices.filter(d =>
+      d.ip.toLowerCase().includes(query) ||
+      d.hostname.toLowerCase().includes(query) ||
+      d.mac.toLowerCase().includes(query)
+    );
+    renderTable(filtered);
+  });
+
+  // ── Manual Scan Button ──
+  function manualRefresh() {
+    refreshDevices(true);
+  }
+
+  // ── Auto Countdown + Refresh ──
+  setInterval(() => {
+    countdown--;
+    if (countdown <= 0) {
+      refreshDevices();
+      countdown = 30;
+    }
+    document.getElementById('next-scan-text').textContent =
+      `Next auto-scan in ${countdown}s`;
+  }, 1000);
+
+  // ── Load devices on page start ──
+  refreshDevices();
 </script>
-
 {% endblock %}

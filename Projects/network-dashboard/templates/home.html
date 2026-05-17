@@ -2,31 +2,163 @@
 
 {% block content %}
 
-<h2>Welcome to your Network Dashboard 👋</h2>
-<p style="color: #94a3b8;">Monitor all devices connected to your network in real time.</p>
-
-<div class="cards">
-    <div class="card">
-        <h2>{{ device_count }}</h2>
-        <p>Devices Online</p>
-    </div>
-    <div class="card">
-        <h2>🟢</h2>
-        <p>Network Status: Active</p>
-    </div>
-    <div class="card">
-        <h2>🔒</h2>
-        <p>Monitoring Active</p>
-    </div>
+<!-- Hero Section -->
+<div class="hero">
+  <div class="hero-badge">
+    <span>🟢</span> Live Monitoring Active
+  </div>
+  <h2>Your Network,<br><span class="highlight">Under Control.</span></h2>
+  <p>Real-time visibility into every device on your network. Detect threats, monitor activity, stay protected.</p>
+  <div class="hero-actions">
+    <a href="/devices" class="btn btn-primary">
+      <span>📡</span> View Devices
+    </a>
+    <a href="/alerts" class="btn btn-outline">
+      <span>🚨</span> Check Alerts
+    </a>
+  </div>
 </div>
 
-<a href="/devices" style="
-    background-color: #38bdf8;
-    color: #0f172a;
-    padding: 10px 20px;
-    border-radius: 8px;
-    text-decoration: none;
-    font-weight: bold;
-">View All Devices →</a>
+<!-- Stat Cards -->
+<div class="cards-grid">
 
+  <div class="card">
+    <div class="card-icon blue">📡</div>
+    <div class="card-trend stable">LIVE</div>
+    <div class="card-value" id="stat-devices">{{ device_count }}</div>
+    <div class="card-label">Devices Online</div>
+  </div>
+
+  <div class="card">
+    <div class="card-icon green">🛡️</div>
+    <div class="card-trend up">SAFE</div>
+    <div class="card-value" id="stat-alerts">0</div>
+    <div class="card-label">Active Alerts</div>
+  </div>
+
+  <div class="card">
+    <div class="card-icon orange">⏱️</div>
+    <div class="card-trend stable">AUTO</div>
+    <div class="card-value">30s</div>
+    <div class="card-label">Scan Interval</div>
+  </div>
+
+  <div class="card">
+    <div class="card-icon red">🔒</div>
+    <div class="card-trend stable">ON</div>
+    <div class="card-value">24/7</div>
+    <div class="card-label">Monitoring</div>
+  </div>
+
+</div>
+
+<!-- Quick Device Preview Panel -->
+<div class="panel">
+  <div class="panel-header">
+    <div class="panel-title">
+      <div class="dot"></div>
+      Quick Device Overview
+    </div>
+    <div class="panel-actions">
+      <a href="/devices" class="btn btn-ghost">View All →</a>
+    </div>
+  </div>
+
+  <div class="table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>Hostname</th>
+          <th>MAC Address</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="home-device-body">
+        {% for device in devices %}
+        <tr>
+          <td class="td-mono">{{ device.ip }}</td>
+          <td class="td-hostname">
+            {% if '(You)' in device.hostname %}
+              {{ device.hostname.replace('(You)', '') }}
+              <span class="you-badge">YOU</span>
+            {% else %}
+              {{ device.hostname }}
+            {% endif %}
+          </td>
+          <td class="td-mono">{{ device.mac }}</td>
+          <td><span class="badge badge-online"><span class="badge-dot"></span>Online</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel-footer">
+    <div class="update-info">
+      <div class="live-dot"></div>
+      <span id="home-last-updated">Just loaded</span>
+    </div>
+    <span class="next-scan" id="home-next-scan">Next scan in 30s</span>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  let countdown = 30;
+
+  function updateHomeStats() {
+    // Update device count
+    fetch('/api/devices')
+      .then(r => r.json())
+      .then(devices => {
+        document.getElementById('stat-devices').textContent = devices.length;
+
+        // Update quick preview table
+        const tbody = document.getElementById('home-device-body');
+        tbody.innerHTML = '';
+        devices.forEach(device => {
+          const isYou = device.hostname.includes('(You)');
+          const name = isYou ? device.hostname.replace('(You)', '').trim() : device.hostname;
+          tbody.innerHTML += `
+            <tr>
+              <td class="td-mono">${device.ip}</td>
+              <td class="td-hostname">
+                ${name}
+                ${isYou ? '<span class="you-badge">YOU</span>' : ''}
+              </td>
+              <td class="td-mono">${device.mac}</td>
+              <td><span class="badge badge-online"><span class="badge-dot"></span>Online</span></td>
+            </tr>
+          `;
+        });
+
+        const now = new Date();
+        document.getElementById('home-last-updated').textContent =
+          'Updated at ' + now.toLocaleTimeString();
+        countdown = 30;
+      })
+      .catch(() => {});
+
+    // Update alert count card
+    fetch('/api/alerts')
+      .then(r => r.json())
+      .then(alerts => {
+        document.getElementById('stat-alerts').textContent = alerts.length;
+      })
+      .catch(() => {});
+  }
+
+  // Countdown timer
+  setInterval(() => {
+    countdown--;
+    if (countdown <= 0) countdown = 30;
+    document.getElementById('home-next-scan').textContent = `Next scan in ${countdown}s`;
+  }, 1000);
+
+  // Auto refresh every 30 seconds
+  setInterval(updateHomeStats, 30000);
+</script>
 {% endblock %}
