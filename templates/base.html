@@ -1,63 +1,106 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
+<!--
+  base.html — LanSentry Shell Template
+  =====================================
+  Every page in LanSentry extends this file.
+  It provides:
+    • <head> with CSS, fonts, Chart.js
+    • Sticky navbar with alert badge + theme toggle + mobile hamburger
+    • Global JS: theme system, toast notifications, alert badge polling
+    • {% block content %} — each page fills this
+    • {% block scripts %} — page-specific JS goes here
+
+  WHY A BASE TEMPLATE?
+  DRY principle (Don't Repeat Yourself). The navbar HTML and global JS
+  only exist in one place. Fixing a bug here fixes it on every page.
+
+  INTERVIEW NOTE:
+  This is Jinja2 template inheritance. Flask finds the file by looking
+  in the /templates folder (configured at app init time).
+-->
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{% block title %}LanSentry{% endblock %}</title>
-  <link rel="stylesheet" href="/static/style.css" />
+
+  <!-- Google Fonts: Syne (headings/UI) + Space Mono (data/IP addresses) -->
+  <!-- WHY TWO FONTS? Syne gives personality; Space Mono makes IPs and MACs
+       instantly readable (monospace = fixed-width = columns align) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- Chart.js — loaded ONCE in the base template so all pages can use it -->
+  <!-- WHY CDN? Faster delivery via edge servers; browser caches it across pages -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+
+  <!-- Global stylesheet — CSS custom properties (variables) power the theme system -->
+  <link rel="stylesheet" href="/static/style.css" />
+
+  <!-- Page-specific <head> additions (extra styles, meta tags, etc.) -->
   {% block extra_head %}{% endblock %}
-  {#
-    ✦ BUG FIX: removed the stray "← add this line" plain-text comment that
-       was sitting after the endblock tag.  In Jinja2 templates anything
-       outside {# … #} or {% … %} or {{ … }} is rendered literally into the
-       HTML, so that arrow comment was being written into the <head> and was
-       visible as raw text in the browser's page source (and sometimes on-screen
-       in certain render modes).
-  #}
 </head>
+
 <body>
+  <!-- ═══════════════════════════════════════════════════
+       NAVBAR
+       Sticky top bar present on every page.
+       Contains: brand, nav links, alert badge, theme toggle, hamburger.
+  ═══════════════════════════════════════════════════ -->
+  <nav class="navbar" role="navigation" aria-label="Main navigation">
 
-  <!-- ══════════════════════════════════
-       NAVBAR — top navigation bar
-       Shown on every page (base template)
-  ══════════════════════════════════ -->
-  <nav class="navbar">
-
-    <!-- Brand Logo + Name -->
+    <!-- Brand: clicking goes to dashboard -->
     <a class="navbar-brand" href="/">
-      <div class="logo-icon">🛡️</div>
+      <div class="logo-icon" aria-hidden="true">🛡️</div>
       <h1>Lan<span>Sentry</span></h1>
     </a>
 
-    <!-- Desktop Navigation Links -->
-    <ul class="nav-links">
-      <li><a href="/"        id="nav-home">🏠 Home</a></li>
-      <li><a href="/devices" id="nav-devices">📡 Devices</a></li>
-      <li><a href="/alerts"  id="nav-alerts">
+    <!-- Desktop nav links (hidden on mobile — hamburger shows instead) -->
+    <ul class="nav-links" role="list">
+      <li><a href="/"        id="nav-home"    >🏠 Home</a></li>
+      <li><a href="/devices" id="nav-devices" >📡 Devices</a></li>
+      <li><a href="/alerts"  id="nav-alerts"  >
         🚨 Alerts
-        <!-- Alert badge — shows unread count, hidden when 0 -->
-        <span class="alert-badge" id="alert-count" style="display:none">0</span>
+        <!--
+          Alert badge:
+          • Starts hidden (display:none)
+          • updateAlertBadge() below polls /api/alerts/unread-count every 30s
+          • Shows the integer count when > 0
+          INTERVIEW: This is a polling pattern — simpler than WebSockets
+          but adds one HTTP request per client per 30 seconds.
+        -->
+        <span class="alert-badge" id="alert-count" style="display:none" aria-label="unread alerts">0</span>
       </a></li>
-      <li><a href="/history" id="nav-history">🕐 History</a></li>
+      <li><a href="/history" id="nav-history" >🕐 History</a></li>
     </ul>
 
-    <!-- Right side — Status indicator + Theme toggle + Hamburger -->
+    <!-- Right-side controls -->
     <div class="nav-right">
 
-      <!-- Green dot showing network is active -->
-      <div class="network-status">
-        <div class="status-dot"></div>
-        Network Active
+      <!-- Live scanner status pill — green dot = scanner is running -->
+      <div class="network-status" id="network-status-pill" aria-live="polite">
+        <div class="status-dot" id="scanner-status-dot"></div>
+        <span id="scanner-status-text">Network Active</span>
       </div>
 
-      <!-- Dark/Light mode toggle button -->
-      <button class="theme-toggle" id="theme-toggle" title="Toggle dark/light mode">
+      <!--
+        Theme Toggle:
+        Clicking this adds/removes 'light-mode' class on <body>.
+        All colours are CSS custom properties (variables) — the class swap
+        instantly re-values every colour on the page without JS.
+        The choice is saved in localStorage so it survives page reload.
+
+        INTERVIEW: CSS custom properties cascade — when you change :root
+        variables, every element that references them updates in one repaint.
+        No JS needed to walk the DOM and update colours individually.
+      -->
+      <button class="theme-toggle" id="theme-toggle" title="Toggle dark/light mode" aria-label="Toggle theme">
         <div class="toggle-knob" id="toggle-knob">🌙</div>
       </button>
 
-      <!-- Hamburger menu button (mobile only) -->
-      <button class="hamburger" id="hamburger" aria-label="Menu">
+      <!-- Hamburger: only visible on mobile (CSS hides it on desktop) -->
+      <button class="hamburger" id="hamburger" aria-label="Open menu" aria-expanded="false">
         <span></span>
         <span></span>
         <span></span>
@@ -65,150 +108,231 @@
     </div>
   </nav>
 
-  <!-- Mobile Navigation Drawer (slides down on hamburger click) -->
-  <div class="mobile-nav" id="mobile-nav">
+  <!-- Mobile nav drawer — slides in when hamburger is clicked -->
+  <div class="mobile-nav" id="mobile-nav" role="dialog" aria-label="Mobile navigation">
     <a href="/">🏠 Home</a>
     <a href="/devices">📡 Devices</a>
-    <a href="/alerts">🚨 Alerts</a>
+    <a href="/alerts">🚨 Alerts <span class="mobile-badge" id="mobile-alert-count" style="display:none">0</span></a>
     <a href="/history">🕐 History</a>
   </div>
 
-  <!-- ══════════════════════════════════
-       PAGE CONTENT
-       Each page fills this section
-  ══════════════════════════════════ -->
+  <!-- ═══════════════════════════════════════════════════
+       PAGE CONTENT — each child template fills this block
+  ═══════════════════════════════════════════════════ -->
   <div class="container">
     {% block content %}{% endblock %}
   </div>
 
-  <!-- Toast notification container (bottom right corner) -->
-  <div class="toast-container" id="toast-container"></div>
+  <!-- Toast container — fixed bottom-right, JS injects toasts here -->
+  <div class="toast-container" id="toast-container" aria-live="assertive"></div>
 
-  <!-- ══════════════════════════════════
+  <!-- ═══════════════════════════════════════════════════
        GLOBAL JAVASCRIPT
-       Runs on every page
-  ══════════════════════════════════ -->
+       Runs on EVERY page. Keep this lean — page-specific
+       logic belongs in {% block scripts %}.
+  ═══════════════════════════════════════════════════ -->
   <script>
+  // ─────────────────────────────────────────────────────
+  // 1. THEME SYSTEM
+  // ─────────────────────────────────────────────────────
+  // We track theme on <html data-theme="dark|light">.
+  // CSS reads this attribute: html[data-theme="light"] { --bg-primary: #fff; }
+  // INTERVIEW: Why data-theme on <html> instead of a class on <body>?
+  // → <html> is the topmost element, so CSS variables defined there cascade
+  //   to everything. Also, <html data-theme> is the W3C-recommended pattern
+  //   and works before the body renders (no flash of wrong theme).
 
-    // ── Theme Toggle (Dark / Light Mode) ──
+  const html       = document.documentElement;   // <html> element
+  const toggleBtn  = document.getElementById('theme-toggle');
+  const toggleKnob = document.getElementById('toggle-knob');
 
-    const body        = document.body;
-    const themeToggle = document.getElementById('theme-toggle');
-    const toggleKnob  = document.getElementById('toggle-knob');
+  // Restore saved preference (or default to dark)
+  const savedTheme = localStorage.getItem('lansentry-theme') || 'dark';
+  html.setAttribute('data-theme', savedTheme);
+  toggleKnob.textContent = savedTheme === 'light' ? '☀️' : '🌙';
+  // Also keep body class in sync (our CSS uses both for compatibility)
+  if (savedTheme === 'light') document.body.classList.add('light-mode');
 
-    // Load saved theme from browser's localStorage
-    // localStorage persists across page refreshes
-    const savedTheme = localStorage.getItem('theme');
-    if (savedTheme === 'light') {
-      body.classList.add('light-mode');
-      toggleKnob.textContent = '☀️';  // Show sun icon in light mode
-    }
+  toggleBtn.addEventListener('click', () => {
+    const current = html.getAttribute('data-theme');
+    const next    = current === 'dark' ? 'light' : 'dark';
 
-    // When toggle is clicked, switch theme
-    themeToggle.addEventListener('click', () => {
-      body.classList.toggle('light-mode'); // Add/remove 'light-mode' class
+    html.setAttribute('data-theme', next);
+    document.body.classList.toggle('light-mode', next === 'light');
+    toggleKnob.textContent = next === 'light' ? '☀️' : '🌙';
+    localStorage.setItem('lansentry-theme', next);
 
-      const isLight = body.classList.contains('light-mode');
-      toggleKnob.textContent = isLight ? '☀️' : '🌙';  // Update icon
+    // Dispatch a custom event so Chart.js listeners can re-render with new colours
+    // INTERVIEW: Custom events let loosely-coupled modules communicate.
+    // The dashboard's chart code listens for 'themeChanged' — it doesn't
+    // need to know anything about the toggle button.
+    document.dispatchEvent(new CustomEvent('themeChanged', { detail: { theme: next } }));
+  });
 
-      // Save preference so it persists after refresh
-      localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  // Helper used by chart code to pick colours based on current theme
+  function isDarkMode() {
+    return html.getAttribute('data-theme') === 'dark';
+  }
 
-      // Notify chart scripts so they can re-render with the new colour palette
-      document.dispatchEvent(new CustomEvent('themeChanged'));
+
+  // ─────────────────────────────────────────────────────
+  // 2. HAMBURGER MENU (mobile)
+  // ─────────────────────────────────────────────────────
+  const hamburger = document.getElementById('hamburger');
+  const mobileNav = document.getElementById('mobile-nav');
+
+  hamburger.addEventListener('click', () => {
+    const isOpen = mobileNav.classList.toggle('open');
+    hamburger.setAttribute('aria-expanded', isOpen);
+    // aria-expanded is important for screen readers — tells them the menu state
+  });
+
+  // Close the drawer when a link is tapped
+  mobileNav.querySelectorAll('a').forEach(link => {
+    link.addEventListener('click', () => {
+      mobileNav.classList.remove('open');
+      hamburger.setAttribute('aria-expanded', 'false');
     });
+  });
 
 
-    // ── Hamburger Menu (Mobile) ──
-
-    const hamburger = document.getElementById('hamburger');
-    const mobileNav = document.getElementById('mobile-nav');
-
-    // Toggle mobile nav open/closed
-    hamburger.addEventListener('click', () => {
-      mobileNav.classList.toggle('open');
-    });
-
-    // Close mobile nav when any link is clicked
-    mobileNav.querySelectorAll('a').forEach(link => {
-      link.addEventListener('click', () => {
-        mobileNav.classList.remove('open');
-      });
-    });
-
-
-    // ── Active Nav Link Highlighting ──
-    // Adds 'active' class to the current page's nav link
-
-    const path = window.location.pathname;
-    if (path === '/')          document.getElementById('nav-home').classList.add('active');
-    if (path === '/devices')   document.getElementById('nav-devices').classList.add('active');
-    if (path === '/alerts')    document.getElementById('nav-alerts').classList.add('active');
-    if (path.startsWith('/history')) document.getElementById('nav-history').classList.add('active');
-
-
-    // ── Toast Notification System ──
-    // showToast() can be called from any page to show a popup message
-
-    function showToast(message, type = 'info', duration = 3000) {
-      const container = document.getElementById('toast-container');
-
-      // Emoji icons for each toast type
-      const icons = { success: '✅', error: '❌', info: 'ℹ️' };
-
-      // Create the toast element
-      const toast = document.createElement('div');
-      toast.className = `toast ${type}`;
-      toast.innerHTML = `<span>${icons[type]}</span><span>${message}</span>`;
-
-      // Add to page
-      container.appendChild(toast);
-
-      // Auto-remove after 'duration' milliseconds
-      setTimeout(() => {
-        toast.style.animation = 'toastOut 0.3s ease forwards';
-        setTimeout(() => toast.remove(), 300);
-      }, duration);
+  // ─────────────────────────────────────────────────────
+  // 3. ACTIVE NAV LINK HIGHLIGHTING
+  // ─────────────────────────────────────────────────────
+  // Runs once on load — compares window.location.pathname to each route
+  // and adds the 'active' CSS class to the matching link.
+  const path = window.location.pathname;
+  const navMap = {
+    '/':        'nav-home',
+    '/devices': 'nav-devices',
+    '/alerts':  'nav-alerts',
+    '/history': 'nav-history',
+  };
+  // Find best match (exact first, then startsWith for nested routes)
+  for (const [route, id] of Object.entries(navMap)) {
+    if (path === route || (route !== '/' && path.startsWith(route))) {
+      document.getElementById(id)?.classList.add('active');
+      break;
     }
+  }
 
 
-    // ── Alert Badge in Navbar ──
-    // Polls /api/alerts/unread-count every 30 seconds and shows the count
-    // badge on the Alerts nav link when there are unread items.
+  // ─────────────────────────────────────────────────────
+  // 4. TOAST NOTIFICATION SYSTEM
+  // ─────────────────────────────────────────────────────
+  // showToast(message, type, duration) — callable from any page.
+  // type: 'success' | 'error' | 'info' | 'warning'
+  // INTERVIEW: We build the DOM element in JS and inject it rather than
+  // keeping hidden elements in HTML, because we may show multiple toasts
+  // simultaneously. Dynamic creation scales better.
 
-    function updateAlertBadge() {
-      // ✦ BUG FIX: was calling /api/alerts which returns
-      //   { "success": true, "alerts": [...], "count": N }
-      //   and then reading  alerts.length  — which is undefined on an object,
-      //   so the badge was always hidden (condition was always falsy).
-      //
-      //   Fix 1: use the dedicated /api/alerts/unread-count endpoint instead.
-      //          It returns { "success": true, "count": N } — simpler and faster
-      //          because it runs a COUNT(*) query rather than fetching all rows.
-      //   Fix 2: read  data.count  (the integer) instead of  data.length.
-      fetch('/api/alerts/unread-count')
-        .then(r => r.json())
-        .then(data => {
-          const badge = document.getElementById('alert-count');
-          if (data.count > 0) {
-            // Show the badge and display the unread count
-            badge.textContent = data.count;
-            badge.style.display = 'inline';
-          } else {
-            // No unread alerts — hide the badge entirely
-            badge.style.display = 'none';
-          }
-        })
-        .catch(() => {}); // Silently ignore network errors
+  function showToast(message, type = 'info', duration = 3500) {
+    const container = document.getElementById('toast-container');
+    const icons = { success: '✅', error: '❌', info: 'ℹ️', warning: '⚠️' };
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    // escapeHTML prevents XSS: if 'message' contained '<script>', it won't execute
+    toast.innerHTML = `
+      <span class="toast-icon">${icons[type] || 'ℹ️'}</span>
+      <span class="toast-msg">${escapeHTML(message)}</span>
+      <button class="toast-close" onclick="this.parentElement.remove()" aria-label="Dismiss">×</button>
+    `;
+
+    container.appendChild(toast);
+
+    // Trigger CSS entrance animation on next frame
+    requestAnimationFrame(() => toast.classList.add('toast-visible'));
+
+    // Auto-dismiss after `duration` ms
+    setTimeout(() => {
+      toast.classList.remove('toast-visible');
+      toast.classList.add('toast-hiding');
+      setTimeout(() => toast.remove(), 350);   // Wait for exit animation
+    }, duration);
+  }
+
+  // escapeHTML — converts < > & " ' to HTML entities so user-supplied
+  // strings can be safely inserted into innerHTML without executing scripts.
+  // INTERVIEW: This is the primary XSS (Cross-Site Scripting) defence on
+  // the client side. NEVER skip this when inserting dynamic content.
+  function escapeHTML(str) {
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(String(str)));
+    return div.innerHTML;
+  }
+
+
+  // ─────────────────────────────────────────────────────
+  // 5. ALERT BADGE — polls /api/alerts/unread-count
+  // ─────────────────────────────────────────────────────
+  // WHY /unread-count not /alerts?
+  // → Fetching full alerts just to get a count wastes bandwidth.
+  //   The dedicated endpoint returns {"count": N} — tiny payload,
+  //   fast to process, called every 30 seconds from every page.
+
+  async function updateAlertBadge() {
+    try {
+      const res   = await fetch('/api/alerts/unread-count');
+      const data  = await res.json();
+      const count = data.count || 0;
+
+      const badge       = document.getElementById('alert-count');
+      const mobileBadge = document.getElementById('mobile-alert-count');
+
+      if (count > 0) {
+        const display = count > 99 ? '99+' : String(count);   // Cap at 99+
+        badge.textContent       = display;
+        mobileBadge.textContent = display;
+        badge.style.display       = 'inline';
+        mobileBadge.style.display = 'inline';
+      } else {
+        badge.style.display       = 'none';
+        mobileBadge.style.display = 'none';
+      }
+    } catch {
+      // Silently swallow — badge not updating is non-critical
     }
+  }
 
-    // Run immediately on page load, then repeat every 30 seconds
-    updateAlertBadge();
-    setInterval(updateAlertBadge, 30000);
+  updateAlertBadge();
+  setInterval(updateAlertBadge, 30000);   // Re-check every 30 seconds
+
+
+  // ─────────────────────────────────────────────────────
+  // 6. SCANNER STATUS PILL
+  // ─────────────────────────────────────────────────────
+  // Polls /api/scan-status and updates the "Network Active" pill in the navbar.
+  // The dot turns amber while a scan is running.
+
+  async function updateScannerPill() {
+    try {
+      const res  = await fetch('/api/scan-status');
+      const data = await res.json();
+
+      const dot  = document.getElementById('scanner-status-dot');
+      const text = document.getElementById('scanner-status-text');
+
+      if (data.scan_running) {
+        dot.style.background  = 'var(--warning)';
+        dot.style.boxShadow   = '0 0 8px var(--warning)';
+        text.textContent      = 'Scanning…';
+      } else {
+        dot.style.background  = 'var(--success)';
+        dot.style.boxShadow   = '0 0 8px var(--success)';
+        text.textContent      = 'Network Active';
+      }
+    } catch {
+      // If API is down, keep pill as-is
+    }
+  }
+
+  updateScannerPill();
+  setInterval(updateScannerPill, 15000);   // Every 15 seconds
 
   </script>
 
-  <!-- Page-specific scripts go here -->
+  <!-- Page-specific JavaScript injected here by child templates -->
   {% block scripts %}{% endblock %}
 
 </body>

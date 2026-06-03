@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+
+{% block title %}Scan History — LanSentry{% endblock %}
+
+{% block content %}
+<!--
+  history.html — LanSentry Scan History
+  =======================================
+  Shows a paginated table of every completed scan stored in the
+  'scan_history' table: timestamp, devices found, new devices, duration.
+
+  This page was missing (nav link returned 404). Now it's a real page.
+-->
+
+<div class="page-header">
+  <div>
+    <div class="breadcrumb">LanSentry / <span>History</span></div>
+    <h2>Scan History</h2>
+    <p>Every network scan recorded since LanSentry started</p>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-header">
+    <div class="panel-title">
+      <div class="dot"></div>
+      Scan Records
+      <span class="count-badge" id="history-count">–</span>
+    </div>
+    <div class="panel-actions">
+      <select id="limit-select" onchange="loadHistory()" style="padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--bg-card); color:var(--text-primary); font-family:inherit;">
+        <option value="25">Last 25</option>
+        <option value="50" selected>Last 50</option>
+        <option value="100">Last 100</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Scan Time</th>
+          <th>Subnet</th>
+          <th>Devices Found</th>
+          <th>New Devices</th>
+          <th>Duration</th>
+        </tr>
+      </thead>
+      <tbody id="history-tbody">
+        <tr><td colspan="6"><div class="empty-state"><div class="empty-icon">⏳</div><p>Loading…</p></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel-footer">
+    <div class="update-info">
+      <div class="live-dot"></div>
+      <span id="history-updated">Loading…</span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadHistory() {
+  const limit = document.getElementById('limit-select').value;
+  try {
+    const res  = await fetch(`/api/scan-history?limit=${limit}`);
+    const data = await res.json();
+
+    if (!data.success) throw new Error('API error');
+
+    document.getElementById('history-count').textContent = data.records.length;
+
+    const tbody = document.getElementById('history-tbody');
+    if (data.records.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">📡</div><p>No scan history yet.</p></div></td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = data.records.map((r, i) => {
+      const dt  = new Date(r.scan_time);
+      const ts  = dt.toLocaleDateString() + ' ' + dt.toLocaleTimeString();
+      const dur = `${r.scan_duration.toFixed(1)}s`;
+      const newClass = r.new_devices > 0 ? 'style="color:var(--warning)"' : '';
+      return `
+        <tr>
+          <td class="td-mono" style="color:var(--text-muted)">${i + 1}</td>
+          <td class="td-mono">${escapeHTML(ts)}</td>
+          <td class="td-mono">${escapeHTML(r.subnet || '—')}</td>
+          <td><strong>${r.devices_found}</strong></td>
+          <td ${newClass}>${r.new_devices > 0 ? '🆕 ' : ''}${r.new_devices}</td>
+          <td class="td-mono">${dur}</td>
+        </tr>`;
+    }).join('');
+
+    document.getElementById('history-updated').textContent =
+      'Loaded at ' + new Date().toLocaleTimeString();
+
+  } catch (err) {
+    document.getElementById('history-tbody').innerHTML =
+      `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">❌</div><p>Failed to load history.</p></div></td></tr>`;
+  }
+}
+
+loadHistory();
+</script>
+{% endblock %}
