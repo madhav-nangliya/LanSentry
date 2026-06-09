@@ -114,7 +114,7 @@ def _create_tables():
                 hostname     VARCHAR(255) DEFAULT 'Unknown',
                 vendor       VARCHAR(255) DEFAULT 'Unknown',
                 os_guess     VARCHAR(255) DEFAULT 'Unknown',
-                open_ports   TEXT         DEFAULT '',
+                open_ports   TEXT         NULL,
                 status       ENUM('online','offline','blocked') DEFAULT 'online',
                 is_blocked   TINYINT(1)   DEFAULT 0,
                 risk_level   ENUM('low','medium','high') DEFAULT 'low',

@@ -1,788 +1,703 @@
-{# =============================================================================
-   home.html — LanSentry Dashboard (Week 4: Chart.js Integration)
-   =============================================================================
-   Extends base.html which provides:
-     • The <head> with CSS + meta tags
-     • The navbar (with dark/light toggle + alert badge)
-     • The <main> block we fill in below
-     • The <footer>
+<!DOCTYPE html>
+<!--
+  home.html — LanSentry Dashboard
+  ════════════════════════════════════════════════════════════════
+  ZERO Jinja2. Flask serves this file as plain bytes with
+  send_from_directory(). Every number you see on this page is
+  fetched AFTER load via JavaScript fetch() calls to /api/* endpoints.
 
-   Week 4 additions (marked ★):
-     ★ Chart.js loaded from CDN
-     ★ Line chart   — devices online over the last 24 hours
-     ★ Doughnut     — online / offline / blocked breakdown
-     ★ Bar chart    — daily alerts by type (last 7 days)
-     ★ Doughnut     — risk level breakdown
-     ★ All charts fetch data from the /api/chart/* endpoints via fetch()
-     ★ Charts auto-refresh every 60 seconds
-   ============================================================================= #}
+  Data flow:
+    Browser loads home.html (static file, instant)
+       ↓  JS runs
+    fetch("/api/scan-status")        → updates "Last scan" + button state
+    fetch("/api/chart/device-status")→ fills stat cards + doughnut chart
+    fetch("/api/chart/scan-history") → draws line chart
+    fetch("/api/chart/risk-breakdown")→ draws risk doughnut
+    fetch("/api/chart/alerts")       → draws bar chart
+    fetch("/api/alerts/unread-count")→ updates nav badge (in base JS)
+  ════════════════════════════════════════════════════════════════
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard — LanSentry</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Chart.js — loaded from CDN. We need it before our inline scripts run. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 
-{% extends "base.html" %}
-{# ↑ This tells Jinja2 to use base.html as the skeleton and fill in the blocks below #}
+  <style>
+    /* ── Dashboard-only styles (not in global style.css) ── */
 
-{% block title %}Dashboard — LanSentry{% endblock %}
-{# ↑ Fills the <title> block defined in base.html #}
+    /* Fixed-height card that wraps each Chart.js canvas */
+    .chart-card {
+      background:    var(--bg-card);
+      border:        1px solid var(--border);
+      border-radius: 12px;
+      padding:       20px;
+      margin-bottom: 24px;
+    }
+    .chart-card h3 {
+      font-size:      0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color:          var(--text-muted);
+      margin-bottom:  14px;
+    }
+    .chart-card canvas {
+      max-height: 280px;
+      width: 100% !important;
+    }
 
-{% block extra_head %}
-{# ===============================================================
-   Chart.js CDN
-   We load Chart.js in the <head> (via this block) so it's available
-   before our inline scripts at the bottom of this template run.
-   v4.x API — uses Chart.register() pattern.
-   =============================================================== #}
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    /* Shown while fetch() is in flight; hidden once chart renders */
+    .chart-loading {
+      display:         flex;
+      align-items:     center;
+      justify-content: center;
+      height:          200px;
+      color:           var(--text-muted);
+      font-size:       0.9rem;
+    }
 
-<style>
-  /* ---------------------------------------------------------------
-     Dashboard-specific styles (not in style.css to keep it modular)
-     --------------------------------------------------------------- */
-
-  /* Chart container — fixed height so charts don't collapse to 0 */
-  .chart-card {
-    background: var(--card-bg);         /* Uses CSS variable from style.css */
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 24px;
-    position: relative;                 /* For the loading overlay */
-  }
-
-  .chart-card h3 {
-    font-size: 0.85rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-muted);
-    margin-bottom: 16px;
-  }
-
-  /* Canvas elements inside chart cards */
-  .chart-card canvas {
-    max-height: 280px;                  /* Prevents charts from being too tall */
-    width: 100% !important;            /* Override Chart.js inline width */
-  }
-
-  /* Loading skeleton shown while fetch() is in flight */
-  .chart-loading {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 200px;
-    color: var(--text-muted);
-    font-size: 0.9rem;
-  }
-
-  /* Two-column grid for the two doughnut charts */
-  .charts-row-half {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 24px;
-  }
-
-  /* Stack to single column on mobile */
-  @media (max-width: 640px) {
+    /* Two doughnut charts side-by-side */
     .charts-row-half {
-      grid-template-columns: 1fr;
+      display:               grid;
+      grid-template-columns: 1fr 1fr;
+      gap:                   24px;
     }
-  }
-
-  /* Scan-now button pulse animation */
-  @keyframes pulse-ring {
-    0%   { box-shadow: 0 0 0 0 rgba(99, 179, 237, 0.5); }
-    70%  { box-shadow: 0 0 0 10px rgba(99, 179, 237, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(99, 179, 237, 0); }
-  }
-  .btn-scan-now { animation: pulse-ring 2s infinite; }
-</style>
-{% endblock %}
-
-
-{% block content %}
-{# =====================================================================
-   SECTION 1 — PAGE HEADER
-   Shows the dashboard title + "Scan Now" button
-   ===================================================================== #}
-<div class="page-header">
-  <div>
-    <h1 class="page-title">Network Dashboard</h1>
-    {# last-scan-time is updated by JavaScript below #}
-    <p class="page-subtitle">
-      Last scan: <span id="last-scan-time">Loading…</span>
-    </p>
-  </div>
-
-  {# Scan Now button — calls /api/scan/trigger via POST #}
-  <button
-    class="btn btn-primary btn-scan-now"
-    id="btn-scan-now"
-    onclick="triggerManualScan()"
-  >
-    🔍 Scan Now
-  </button>
-</div>
-
-
-{# =====================================================================
-   SECTION 2 — STAT CARDS
-   Four quick-glance metrics passed from app.py via the `stats` variable.
-   stats = {'total': N, 'online': N, 'offline': N, 'blocked': N, 'high_risk': N}
-   ===================================================================== #}
-<div class="stats-grid">
-  {# Card 1: Total devices ever seen #}
-  <div class="stat-card">
-    <div class="stat-icon stat-icon--blue">🖥️</div>
-    <div class="stat-body">
-      <div class="stat-value" id="stat-total">{{ stats.total }}</div>
-      {# ↑ {{ }} is Jinja2 template syntax — outputs the Python variable value #}
-      <div class="stat-label">Total Devices</div>
-    </div>
-  </div>
-
-  {# Card 2: Currently online #}
-  <div class="stat-card">
-    <div class="stat-icon stat-icon--green">✅</div>
-    <div class="stat-body">
-      <div class="stat-value stat-value--green" id="stat-online">{{ stats.online }}</div>
-      <div class="stat-label">Online Now</div>
-    </div>
-  </div>
-
-  {# Card 3: Currently offline #}
-  <div class="stat-card">
-    <div class="stat-icon stat-icon--grey">⚫</div>
-    <div class="stat-body">
-      <div class="stat-value" id="stat-offline">{{ stats.offline }}</div>
-      <div class="stat-label">Offline</div>
-    </div>
-  </div>
-
-  {# Card 4: Blocked devices #}
-  <div class="stat-card">
-    <div class="stat-icon stat-icon--red">🚫</div>
-    <div class="stat-body">
-      <div class="stat-value stat-value--red" id="stat-blocked">{{ stats.blocked }}</div>
-      <div class="stat-label">Blocked</div>
-    </div>
-  </div>
-
-  {# Card 5: High-risk devices #}
-  <div class="stat-card">
-    <div class="stat-icon stat-icon--orange">⚠️</div>
-    <div class="stat-body">
-      <div class="stat-value stat-value--orange" id="stat-risk">{{ stats.high_risk }}</div>
-      <div class="stat-label">High Risk</div>
-    </div>
-  </div>
-</div>
-
-
-{# =====================================================================
-   SECTION 3 ★ — LINE CHART: Devices Online Over Time
-   Canvas element — Chart.js will draw into this.
-   ===================================================================== #}
-<div class="chart-card">
-  <h3>📈 Devices Online — Last 24 Hours</h3>
-
-  {# Time range selector — changes which data the chart fetches #}
-  <div style="margin-bottom: 12px;">
-    <label style="font-size:0.85rem; color:var(--text-muted);">Time range:</label>
-    <select id="line-chart-range" onchange="loadLineChart()" style="margin-left:8px; font-size:0.85rem; padding:2px 6px;">
-      <option value="6">Last 6 hours</option>
-      <option value="24" selected>Last 24 hours</option>  {# selected = default #}
-      <option value="48">Last 48 hours</option>
-      <option value="168">Last 7 days</option>
-    </select>
-  </div>
-
-  {# Loading state — hidden once chart renders #}
-  <div class="chart-loading" id="line-chart-loading">⏳ Loading scan history…</div>
-
-  {# The actual canvas — hidden until data arrives #}
-  <canvas id="lineChart" style="display:none;"></canvas>
-</div>
-
-
-{# =====================================================================
-   SECTION 4 ★ — TWO DOUGHNUT CHARTS SIDE BY SIDE
-   Left: Device status | Right: Risk breakdown
-   ===================================================================== #}
-<div class="charts-row-half">
-
-  {# Left doughnut: Online / Offline / Blocked #}
-  <div class="chart-card">
-    <h3>🖥️ Device Status</h3>
-    <div class="chart-loading" id="status-chart-loading">⏳ Loading…</div>
-    <canvas id="statusChart" style="display:none;"></canvas>
-  </div>
-
-  {# Right doughnut: Low / Medium / High risk #}
-  <div class="chart-card">
-    <h3>🛡️ Risk Breakdown</h3>
-    <div class="chart-loading" id="risk-chart-loading">⏳ Loading…</div>
-    <canvas id="riskChart" style="display:none;"></canvas>
-  </div>
-
-</div>
-
-
-{# =====================================================================
-   SECTION 5 ★ — BAR CHART: Alerts Per Day (Last 7 Days)
-   ===================================================================== #}
-<div class="chart-card">
-  <h3>🚨 Alerts by Type — Last 7 Days</h3>
-
-  <div style="margin-bottom: 12px;">
-    <label style="font-size:0.85rem; color:var(--text-muted);">Days:</label>
-    <select id="bar-chart-range" onchange="loadBarChart()" style="margin-left:8px; font-size:0.85rem; padding:2px 6px;">
-      <option value="7" selected>Last 7 days</option>
-      <option value="14">Last 14 days</option>
-      <option value="30">Last 30 days</option>
-    </select>
-  </div>
-
-  <div class="chart-loading" id="bar-chart-loading">⏳ Loading alert data…</div>
-  <canvas id="barChart" style="display:none;"></canvas>
-</div>
-
-{% endblock %}
-{# ↑ End of content block #}
-
-
-{% block scripts %}
-{# =====================================================================
-   JAVASCRIPT — All chart logic lives here.
-   This block is inserted just before </body> in base.html.
-   ===================================================================== #}
-<script>
-// ===========================================================================
-// CHART GLOBAL SETTINGS
-// ===========================================================================
-
-// Store chart instances so we can destroy() and recreate when data refreshes.
-// Calling new Chart() on a canvas that already has a chart causes a warning.
-let lineChartInstance  = null;
-let statusChartInstance = null;
-let riskChartInstance  = null;
-let barChartInstance   = null;
-
-// Detect current theme (dark/light) to set matching chart colours.
-// base.html stores the theme on <body data-theme="dark|light">
-function isDarkMode() {
-  return document.body.getAttribute("data-theme") === "dark";
-}
-
-// Shared colour scheme — reuse across all charts for visual consistency
-const CHART_COLORS = {
-  online:  "#48BB78",   // green
-  offline: "#718096",   // grey
-  blocked: "#FC8181",   // red/pink
-  low:     "#48BB78",   // green (low risk = good)
-  medium:  "#F6AD55",   // orange
-  high:    "#FC8181",   // red
-  newDev:  "#63B3ED",   // blue
-  blocked2:"#FC8181",   // red
-  offlineA:"#718096",   // grey
-  highRisk:"#F6AD55",   // orange
-  gridLine: () => isDarkMode() ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)",
-  textColor:() => isDarkMode() ? "#CBD5E0" : "#4A5568",
-};
-
-
-// ===========================================================================
-// SECTION A — LINE CHART: Scan History
-// ===========================================================================
-
-async function loadLineChart() {
-  // Read the currently selected time range from the <select> element
-  const hours = document.getElementById("line-chart-range").value;
-
-  // Show loading state while fetching
-  document.getElementById("line-chart-loading").style.display = "flex";
-  document.getElementById("lineChart").style.display          = "none";
-
-  try {
-    // Fetch data from our Flask API endpoint
-    // The template literal `${hours}` inserts the JS variable into the URL string
-    const res  = await fetch(`/api/chart/scan-history?hours=${hours}`);
-    const data = await res.json();   // Parse JSON response body
-
-    if (!data.success || data.labels.length === 0) {
-      // No data yet (first run before any scans complete)
-      document.getElementById("line-chart-loading").textContent = "No scan data yet — scans run every 60 seconds.";
-      return;
+    @media (max-width: 640px) {
+      .charts-row-half { grid-template-columns: 1fr; }
     }
 
-    // Hide loading, show canvas
-    document.getElementById("line-chart-loading").style.display = "none";
-    document.getElementById("lineChart").style.display          = "block";
+    /* Stat cards grid */
+    .stats-grid {
+      display:               grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap:                   16px;
+      margin-bottom:         28px;
+    }
+    @media (max-width: 900px)  { .stats-grid { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 560px)  { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 
-    // Destroy the old chart instance before creating a new one
-    if (lineChartInstance) lineChartInstance.destroy();
+    .stat-card {
+      background:    var(--bg-card);
+      border:        1px solid var(--border);
+      border-radius: 12px;
+      padding:       20px;
+      display:       flex;
+      align-items:   center;
+      gap:           14px;
+      transition:    var(--transition);
+    }
+    .stat-card:hover {
+      border-color: var(--accent);
+      transform:    translateY(-2px);
+      box-shadow:   var(--shadow-hover);
+    }
+    .stat-icon {
+      width:           44px;
+      height:          44px;
+      border-radius:   10px;
+      display:         flex;
+      align-items:     center;
+      justify-content: center;
+      font-size:       20px;
+      flex-shrink:     0;
+    }
+    .stat-icon--blue   { background: rgba(0,212,255,0.1); }
+    .stat-icon--green  { background: rgba(0,255,148,0.1); }
+    .stat-icon--grey   { background: rgba(113,128,150,0.1); }
+    .stat-icon--red    { background: rgba(255,71,87,0.1); }
+    .stat-icon--orange { background: rgba(255,107,53,0.1); }
 
-    const ctx = document.getElementById("lineChart").getContext("2d");
-    // getContext("2d") gets the 2D drawing context — Chart.js draws into this
+    .stat-value {
+      font-size:    28px;
+      font-weight:  800;
+      font-family:  'Space Mono', monospace;
+      line-height:  1;
+    }
+    .stat-value--green  { color: var(--success); }
+    .stat-value--red    { color: var(--danger); }
+    .stat-value--orange { color: var(--warning); }
 
-    lineChartInstance = new Chart(ctx, {
-      type: "line",   // Line chart
+    .stat-label {
+      font-size:      11px;
+      color:          var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-top:     4px;
+    }
 
-      data: {
-        labels: data.labels,   // X-axis: ["10:00", "10:01", …]
+    /* Page header row */
+    .page-header-row {
+      display:         flex;
+      align-items:     center;
+      justify-content: space-between;
+      flex-wrap:       wrap;
+      gap:             12px;
+      margin-bottom:   28px;
+    }
+    .page-title   { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
+    .page-subtitle { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
 
-        datasets: [
-          {
-            // Dataset 1: Total devices found
-            label:           "Devices Online",
-            data:            data.devices_found,   // Y values
-            borderColor:     CHART_COLORS.online,  // Line colour
-            backgroundColor: "rgba(72,187,120,0.1)", // Filled area under line
-            borderWidth:     2,
-            tension:         0.4,   // 0 = straight lines, 1 = very curved
-            fill:            true,  // Fill area under the line
-            pointRadius:     3,     // Dot size at each data point
-            pointHoverRadius:6,     // Dot size on mouse hover
-          },
-          {
-            // Dataset 2: New devices (stacked on same axis for reference)
-            label:           "New Devices",
-            data:            data.new_devices,
-            borderColor:     CHART_COLORS.newDev,
-            backgroundColor: "rgba(99,179,237,0.1)",
-            borderWidth:     2,
-            tension:         0.4,
-            fill:            false,  // No fill for this dataset
-            borderDash:      [5, 5], // Dashed line to distinguish from dataset 1
-            pointRadius:     3,
-            pointHoverRadius:6,
-          }
-        ]
-      },
+    /* Pulse ring on the Scan Now button */
+    @keyframes pulse-ring {
+      0%   { box-shadow: 0 0 0 0   rgba(99,179,237,0.5); }
+      70%  { box-shadow: 0 0 0 10px rgba(99,179,237,0);   }
+      100% { box-shadow: 0 0 0 0   rgba(99,179,237,0);   }
+    }
+    #btn-scan-now:not(:disabled) { animation: pulse-ring 2s infinite; }
+  </style>
+</head>
+<body>
 
-      options: {
-        responsive:          true,   // Chart resizes with the container
-        maintainAspectRatio: false,  // Lets max-height CSS control height
+  <!-- ── NAVBAR ── -->
+  <nav class="navbar">
+    <a class="navbar-brand" href="/">
+      <div class="logo-icon">🛡️</div>
+      <h1>Lan<span>Sentry</span></h1>
+    </a>
+    <ul class="nav-links">
+      <li><a href="/"        id="nav-home">🏠 Home</a></li>
+      <li><a href="/devices" id="nav-devices">📡 Devices</a></li>
+      <li><a href="/alerts"  id="nav-alerts">
+        🚨 Alerts
+        <span class="alert-badge" id="alert-badge" style="display:none">0</span>
+      </a></li>
+    </ul>
+    <div class="nav-right">
+      <div class="network-status">
+        <div class="status-dot"></div>
+        <span>Network Active</span>
+      </div>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">
+        <div class="toggle-knob" id="toggle-knob">🌙</div>
+      </button>
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </nav>
+  <div class="mobile-nav" id="mobile-nav">
+    <a href="/">🏠 Home</a>
+    <a href="/devices">📡 Devices</a>
+    <a href="/alerts">🚨 Alerts</a>
+  </div>
 
-        plugins: {
-          legend: {
-            labels: { color: CHART_COLORS.textColor() }  // Legend text colour
-          },
-          tooltip: {
-            mode:      "index",       // Show all datasets' values at hovered X position
-            intersect: false,
-          }
-        },
+  <!-- ── MAIN CONTENT ── -->
+  <div class="container">
 
-        scales: {
-          x: {
-            ticks:  { color: CHART_COLORS.textColor(), maxTicksLimit: 12 },
-            // maxTicksLimit stops X-axis labels overlapping on small screens
-            grid:   { color: CHART_COLORS.gridLine() }
-          },
-          y: {
-            beginAtZero: true,   // Y-axis starts at 0
-            ticks: {
-              color:     CHART_COLORS.textColor(),
-              stepSize:  1,       // Only show whole numbers (can't have 2.5 devices)
-            },
-            grid: { color: CHART_COLORS.gridLine() }
-          }
-        },
+    <!-- Page header -->
+    <div class="page-header-row">
+      <div>
+        <h2 class="page-title">Network Dashboard</h2>
+        <p class="page-subtitle">
+          Last scan: <span id="last-scan-time">Loading…</span>
+        </p>
+      </div>
+      <button class="btn btn-primary" id="btn-scan-now" onclick="triggerManualScan()">
+        🔍 Scan Now
+      </button>
+    </div>
 
-        interaction: {
-          mode: "nearest",
-          axis: "x",   // Snap tooltip to nearest X position
-        }
-      }
+    <!-- Stat cards — values filled by refreshStats() -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-icon stat-icon--blue">🖥️</div>
+        <div>
+          <div class="stat-value" id="stat-total">—</div>
+          <div class="stat-label">Total Devices</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon stat-icon--green">✅</div>
+        <div>
+          <div class="stat-value stat-value--green" id="stat-online">—</div>
+          <div class="stat-label">Online Now</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon stat-icon--grey">⚫</div>
+        <div>
+          <div class="stat-value" id="stat-offline">—</div>
+          <div class="stat-label">Offline</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon stat-icon--red">🚫</div>
+        <div>
+          <div class="stat-value stat-value--red" id="stat-blocked">—</div>
+          <div class="stat-label">Blocked</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon stat-icon--orange">⚠️</div>
+        <div>
+          <div class="stat-value stat-value--orange" id="stat-risk">—</div>
+          <div class="stat-label">High Risk</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Line chart: devices online over time -->
+    <div class="chart-card">
+      <h3>📈 Devices Online — Last 24 Hours</h3>
+      <div style="margin-bottom:12px;">
+        <label style="font-size:0.85rem;color:var(--text-muted);">Time range:</label>
+        <select id="line-range" onchange="loadLineChart()"
+                style="margin-left:8px;font-size:0.85rem;padding:2px 6px;
+                       background:var(--bg-secondary);color:var(--text-primary);
+                       border:1px solid var(--border);border-radius:4px;">
+          <option value="6">Last 6 hours</option>
+          <option value="24" selected>Last 24 hours</option>
+          <option value="48">Last 48 hours</option>
+          <option value="168">Last 7 days</option>
+        </select>
+      </div>
+      <div class="chart-loading" id="line-loading">⏳ Loading scan history…</div>
+      <canvas id="lineChart" style="display:none;"></canvas>
+    </div>
+
+    <!-- Two doughnut charts side by side -->
+    <div class="charts-row-half">
+      <div class="chart-card">
+        <h3>🖥️ Device Status</h3>
+        <div class="chart-loading" id="status-loading">⏳ Loading…</div>
+        <canvas id="statusChart" style="display:none;"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>🛡️ Risk Breakdown</h3>
+        <div class="chart-loading" id="risk-loading">⏳ Loading…</div>
+        <canvas id="riskChart" style="display:none;"></canvas>
+      </div>
+    </div>
+
+    <!-- Bar chart: alerts by type -->
+    <div class="chart-card">
+      <h3>🚨 Alerts by Type — Last 7 Days</h3>
+      <div style="margin-bottom:12px;">
+        <label style="font-size:0.85rem;color:var(--text-muted);">Days:</label>
+        <select id="bar-range" onchange="loadBarChart()"
+                style="margin-left:8px;font-size:0.85rem;padding:2px 6px;
+                       background:var(--bg-secondary);color:var(--text-primary);
+                       border:1px solid var(--border);border-radius:4px;">
+          <option value="7"  selected>Last 7 days</option>
+          <option value="14">Last 14 days</option>
+          <option value="30">Last 30 days</option>
+        </select>
+      </div>
+      <div class="chart-loading" id="bar-loading">⏳ Loading alert data…</div>
+      <canvas id="barChart" style="display:none;"></canvas>
+    </div>
+
+  </div><!-- /container -->
+
+  <!-- Toast container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- ── JAVASCRIPT ── -->
+  <script>
+  // ==========================================================================
+  // GLOBAL UTILITIES (copied from base.html pattern — no server-side includes)
+  // ==========================================================================
+
+  // ── Theme ──
+  // Restore saved theme before first paint to avoid a flash of wrong theme.
+  (function() {
+    if (localStorage.getItem("lansentry-theme") === "light") {
+      document.body.classList.add("light-mode");
+    }
+  })();
+
+  function toggleTheme() {
+    document.body.classList.toggle("light-mode");
+    const isLight = document.body.classList.contains("light-mode");
+    document.getElementById("toggle-knob").textContent = isLight ? "☀️" : "🌙";
+    localStorage.setItem("lansentry-theme", isLight ? "light" : "dark");
+    // Re-render charts so they pick up the new colour variables
+    document.dispatchEvent(new CustomEvent("themeChanged"));
+  }
+
+  // ── Hamburger ──
+  document.addEventListener("DOMContentLoaded", () => {
+    // Apply saved theme icon
+    if (document.body.classList.contains("light-mode")) {
+      document.getElementById("toggle-knob").textContent = "☀️";
+    }
+
+    // Highlight active nav link
+    document.getElementById("nav-home").classList.add("active");
+
+    // Hamburger toggle
+    document.getElementById("hamburger").addEventListener("click", () => {
+      document.getElementById("mobile-nav").classList.toggle("open");
     });
 
-  } catch (err) {
-    console.error("Line chart error:", err);
-    document.getElementById("line-chart-loading").textContent = "⚠️ Failed to load chart data.";
-  }
-}
+    // Alert badge
+    updateAlertBadge();
+    setInterval(updateAlertBadge, 30_000);
 
-
-// ===========================================================================
-// SECTION B — DOUGHNUT CHART: Device Status
-// ===========================================================================
-
-async function loadStatusChart() {
-  document.getElementById("status-chart-loading").style.display = "flex";
-  document.getElementById("statusChart").style.display          = "none";
-
-  try {
-    const res  = await fetch("/api/chart/device-status");
-    const data = await res.json();
-
-    if (!data.success) {
-      document.getElementById("status-chart-loading").textContent = "No data.";
-      return;
-    }
-
-    document.getElementById("status-chart-loading").style.display = "none";
-    document.getElementById("statusChart").style.display          = "block";
-
-    if (statusChartInstance) statusChartInstance.destroy();
-
-    const ctx = document.getElementById("statusChart").getContext("2d");
-
-    statusChartInstance = new Chart(ctx, {
-      type: "doughnut",   // Doughnut = pie chart with a hole in the middle
-
-      data: {
-        labels: data.labels,   // ["Online", "Offline", "Blocked"]
-        datasets: [{
-          data:            data.data,   // [N, N, N]
-          backgroundColor: [
-            CHART_COLORS.online,
-            CHART_COLORS.offline,
-            CHART_COLORS.blocked,
-          ],
-          borderWidth:  2,
-          borderColor: isDarkMode() ? "#1A202C" : "#FFFFFF",  // Gap between slices
-          hoverOffset: 8,  // Slice jumps out slightly on hover
-        }]
-      },
-
-      options: {
-        responsive:          true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: {
-            position: "bottom",                             // Legend below the chart
-            labels:   { color: CHART_COLORS.textColor(), padding: 16 }
-          },
-          tooltip: {
-            callbacks: {
-              // Custom tooltip shows percentage alongside raw number
-              label: function(context) {
-                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                const pct   = total > 0 ? Math.round((context.raw / total) * 100) : 0;
-                return ` ${context.label}: ${context.raw} (${pct}%)`;
-              }
-            }
-          }
-        },
-        cutout: "65%",   // Size of the hole (65% = modern doughnut look)
-      }
-    });
-
-  } catch (err) {
-    console.error("Status chart error:", err);
-    document.getElementById("status-chart-loading").textContent = "⚠️ Failed to load.";
-  }
-}
-
-
-// ===========================================================================
-// SECTION C — DOUGHNUT CHART: Risk Breakdown
-// ===========================================================================
-
-async function loadRiskChart() {
-  document.getElementById("risk-chart-loading").style.display = "flex";
-  document.getElementById("riskChart").style.display          = "none";
-
-  try {
-    const res  = await fetch("/api/chart/risk-breakdown");
-    const data = await res.json();
-
-    if (!data.success) {
-      document.getElementById("risk-chart-loading").textContent = "No data.";
-      return;
-    }
-
-    document.getElementById("risk-chart-loading").style.display = "none";
-    document.getElementById("riskChart").style.display          = "block";
-
-    if (riskChartInstance) riskChartInstance.destroy();
-
-    const ctx = document.getElementById("riskChart").getContext("2d");
-
-    riskChartInstance = new Chart(ctx, {
-      type: "doughnut",
-      data: {
-        labels: data.labels,   // ["Low Risk", "Medium Risk", "High Risk"]
-        datasets: [{
-          data:            data.data,
-          backgroundColor: [CHART_COLORS.low, CHART_COLORS.medium, CHART_COLORS.high],
-          borderWidth:     2,
-          borderColor:     isDarkMode() ? "#1A202C" : "#FFFFFF",
-          hoverOffset:     8,
-        }]
-      },
-      options: {
-        responsive:          true,
-        maintainAspectRatio: false,
-        cutout: "65%",
-        plugins: {
-          legend: {
-            position: "bottom",
-            labels:   { color: CHART_COLORS.textColor(), padding: 16 }
-          }
-        }
-      }
-    });
-
-  } catch (err) {
-    console.error("Risk chart error:", err);
-    document.getElementById("risk-chart-loading").textContent = "⚠️ Failed to load.";
-  }
-}
-
-
-// ===========================================================================
-// SECTION D — BAR CHART: Alerts by Type
-// ===========================================================================
-
-async function loadBarChart() {
-  const days = document.getElementById("bar-chart-range").value;
-
-  document.getElementById("bar-chart-loading").style.display = "flex";
-  document.getElementById("barChart").style.display          = "none";
-
-  try {
-    const res  = await fetch(`/api/chart/alerts?days=${days}`);
-    const data = await res.json();
-
-    if (!data.success || data.labels.length === 0) {
-      document.getElementById("bar-chart-loading").textContent = "No alert data for this period.";
-      return;
-    }
-
-    document.getElementById("bar-chart-loading").style.display = "none";
-    document.getElementById("barChart").style.display          = "block";
-
-    if (barChartInstance) barChartInstance.destroy();
-
-    const ctx = document.getElementById("barChart").getContext("2d");
-
-    barChartInstance = new Chart(ctx, {
-      type: "bar",   // Vertical bar chart
-
-      data: {
-        labels: data.labels,   // ["2025-01-15", "2025-01-16", …]
-
-        datasets: [
-          {
-            label:           "New Device",
-            data:            data.new_device,
-            backgroundColor: CHART_COLORS.newDev,
-            borderRadius:    4,  // Rounded bar tops
-            borderSkipped:   false,
-          },
-          {
-            label:           "Blocked Attempt",
-            data:            data.blocked_attempt,
-            backgroundColor: CHART_COLORS.blocked2,
-            borderRadius:    4,
-            borderSkipped:   false,
-          },
-          {
-            label:           "Device Offline",
-            data:            data.device_offline,
-            backgroundColor: CHART_COLORS.offlineA,
-            borderRadius:    4,
-            borderSkipped:   false,
-          },
-          {
-            label:           "High Risk",
-            data:            data.high_risk,
-            backgroundColor: CHART_COLORS.highRisk,
-            borderRadius:    4,
-            borderSkipped:   false,
-          }
-        ]
-      },
-
-      options: {
-        responsive:          true,
-        maintainAspectRatio: false,
-
-        plugins: {
-          legend: {
-            position: "top",
-            labels:   { color: CHART_COLORS.textColor() }
-          }
-        },
-
-        scales: {
-          x: {
-            stacked: true,   // Stack bars on same day (total height = all alert types)
-            ticks:  { color: CHART_COLORS.textColor() },
-            grid:   { display: false }  // Hide vertical gridlines for cleaner look
-          },
-          y: {
-            stacked:     true,   // Must be true on both axes for stacked bars
-            beginAtZero: true,
-            ticks: {
-              color:    CHART_COLORS.textColor(),
-              stepSize: 1,   // Whole numbers only
-            },
-            grid: { color: CHART_COLORS.gridLine() }
-          }
-        }
-      }
-    });
-
-  } catch (err) {
-    console.error("Bar chart error:", err);
-    document.getElementById("bar-chart-loading").textContent = "⚠️ Failed to load.";
-  }
-}
-
-
-// ===========================================================================
-// SECTION E — STATS REFRESH
-// ===========================================================================
-
-async function refreshStats() {
-  /**
-   * Fetch the latest device counts and update the stat cards in-place.
-   * Called on page load and every 30 seconds.
-   * Does NOT reload the whole page — updates only the changed numbers.
-   */
-  try {
-    const res  = await fetch("/api/chart/device-status");
-    const data = await res.json();
-
-    if (!data.success) return;
-
-    // data.data = [online, offline, blocked]
-    document.getElementById("stat-online").textContent  = data.data[0];
-    document.getElementById("stat-offline").textContent = data.data[1];
-    document.getElementById("stat-blocked").textContent = data.data[2];
-
-    // Also update total
-    const total = data.data.reduce((a, b) => a + b, 0);
-    document.getElementById("stat-total").textContent = total;
-
-  } catch (err) {
-    console.warn("Stats refresh failed:", err);
-  }
-}
-
-async function refreshScanTime() {
-  /**
-   * Update the "Last scan: …" text in the page header
-   * by polling /api/scan-status.
-   */
-  try {
-    const res  = await fetch("/api/scan-status");
-    const data = await res.json();
-
-    const el = document.getElementById("last-scan-time");
-
-    if (data.last_scan) {
-      // Convert ISO string to a human-readable relative time
-      const scanDate = new Date(data.last_scan);
-      const diffSec  = Math.round((Date.now() - scanDate.getTime()) / 1000);
-      // Date.now() returns ms; scanDate.getTime() also ms; divide by 1000 = seconds
-
-      if (diffSec < 60) {
-        el.textContent = `${diffSec}s ago`;
-      } else if (diffSec < 3600) {
-        el.textContent = `${Math.round(diffSec / 60)}m ago`;
-      } else {
-        el.textContent = scanDate.toLocaleTimeString();  // "14:35:07"
-      }
-    } else {
-      el.textContent = "No scan yet";
-    }
-
-    // Update the Scan Now button state
-    const btn = document.getElementById("btn-scan-now");
-    if (data.scan_running) {
-      btn.textContent = "⏳ Scanning…";
-      btn.disabled    = true;   // Prevent double-click
-    } else {
-      btn.textContent = "🔍 Scan Now";
-      btn.disabled    = false;
-    }
-
-  } catch (err) {
-    console.warn("Scan status refresh failed:", err);
-  }
-}
-
-
-// ===========================================================================
-// SECTION F — MANUAL SCAN TRIGGER
-// ===========================================================================
-
-async function triggerManualScan() {
-  const btn = document.getElementById("btn-scan-now");
-  btn.textContent = "⏳ Starting…";
-  btn.disabled    = true;
-
-  try {
-    const res  = await fetch("/api/scan/trigger", { method: "POST" });
-    const data = await res.json();
-
-    if (data.success) {
-      btn.textContent = "⏳ Scanning…";
-      // Poll every 3 seconds until scan finishes, then refresh everything
-      const poll = setInterval(async () => {
-        const s = await fetch("/api/scan-status").then(r => r.json());
-        if (!s.scan_running) {
-          clearInterval(poll);
-          // Scan done — reload all charts with fresh data
-          loadLineChart();
-          loadStatusChart();
-          loadRiskChart();
-          loadBarChart();
-          refreshStats();
-          refreshScanTime();
-        }
-      }, 3000);   // Check every 3 seconds
-
-    } else {
-      btn.textContent = "Already running";
-      setTimeout(() => { btn.textContent = "🔍 Scan Now"; btn.disabled = false; }, 2000);
-    }
-
-  } catch (err) {
-    console.error("Manual scan trigger failed:", err);
-    btn.textContent = "⚠️ Error";
-    btn.disabled    = false;
-  }
-}
-
-
-// ===========================================================================
-// SECTION G — INITIALISATION & AUTO-REFRESH
-// ===========================================================================
-
-// Run everything when the DOM is fully loaded
-document.addEventListener("DOMContentLoaded", function () {
-  // Initial load — all four charts fetch their data simultaneously
-  loadLineChart();     // Line chart (async — fetches /api/chart/scan-history)
-  loadStatusChart();   // Left doughnut
-  loadRiskChart();     // Right doughnut
-  loadBarChart();      // Bar chart
-  refreshScanTime();   // Update "Last scan" text
-
-  // Auto-refresh every 60 seconds (matches the scan interval in scanner.py)
-  setInterval(() => {
+    // Bootstrap all charts and stats
     loadLineChart();
     loadStatusChart();
     loadRiskChart();
     loadBarChart();
-    refreshStats();
     refreshScanTime();
-  }, 60 * 1000);  // 60,000 ms = 60 seconds
 
-  // Refresh scan time every 15 seconds (more frequent for accuracy)
-  setInterval(refreshScanTime, 15 * 1000);
+    // Auto-refresh every 60 s (matches scanner interval)
+    setInterval(() => {
+      loadLineChart();
+      loadStatusChart();
+      loadRiskChart();
+      loadBarChart();
+      refreshStats();
+      refreshScanTime();
+    }, 60_000);
 
-  // Re-render charts when user toggles dark/light mode
-  // base.html dispatches a custom 'themeChanged' event when the toggle runs
+    // Faster scan-time refresh (every 15 s keeps "X seconds ago" accurate)
+    setInterval(refreshScanTime, 15_000);
+  });
+
+  // Re-draw charts when theme changes
   document.addEventListener("themeChanged", () => {
-    // Small delay to let CSS variables update before Chart.js reads colours
     setTimeout(() => {
       loadLineChart();
       loadStatusChart();
       loadRiskChart();
       loadBarChart();
-    }, 150);
+    }, 100);
   });
-});
-</script>
-{% endblock %}
+
+  // ── XSS prevention ──
+  function escapeHTML(str) {
+    if (str == null) return "";
+    const el = document.createElement("div");
+    el.textContent = String(str);
+    return el.innerHTML;
+  }
+
+  // ── Toast ──
+  function showToast(msg, type = "info", duration = 3500) {
+    const icons = { success:"✅", error:"❌", info:"ℹ️", warning:"⚠️" };
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `<span>${icons[type]||"ℹ️"}</span><span>${escapeHTML(msg)}</span>`;
+    document.getElementById("toast-container").appendChild(toast);
+    setTimeout(() => {
+      toast.style.animation = "toastOut 0.3s ease forwards";
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
+
+  // ── Alert badge ──
+  function updateAlertBadge() {
+    fetch("/api/alerts/unread-count")
+      .then(r => r.json())
+      .then(data => {
+        const badge = document.getElementById("alert-badge");
+        if (data.count > 0) {
+          badge.textContent   = data.count;
+          badge.style.display = "inline";
+        } else {
+          badge.style.display = "none";
+        }
+      })
+      .catch(() => {});
+  }
+
+  // ==========================================================================
+  // CHART COLOUR PALETTE
+  // ==========================================================================
+  // Centralised here so changing one variable updates every chart.
+  // isDarkMode() reads the body class so it always reflects the current theme.
+  const isDark = () => document.body.classList.contains("light-mode") === false;
+
+  const C = {
+    online:  "#48BB78",
+    offline: "#718096",
+    blocked: "#FC8181",
+    low:     "#48BB78",
+    medium:  "#F6AD55",
+    high:    "#FC8181",
+    blue:    "#63B3ED",
+    grid:    () => isDark() ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)",
+    text:    () => isDark() ? "#CBD5E0" : "#4A5568",
+    border:  () => isDark() ? "#1A202C" : "#FFFFFF",
+  };
+
+  // Chart.js instances — stored so we can destroy() before recreating
+  let chartLine, chartStatus, chartRisk, chartBar;
+
+  // ==========================================================================
+  // A — LINE CHART: Scan History
+  // ==========================================================================
+  async function loadLineChart() {
+    const hours = document.getElementById("line-range").value;
+    show("line-loading"); hide("lineChart");
+
+    try {
+      const data = await fetchJSON(`/api/chart/scan-history?hours=${hours}`);
+
+      if (!data.success || data.labels.length === 0) {
+        setText("line-loading", "No scan data yet — first scan runs on startup.");
+        return;
+      }
+
+      hide("line-loading"); show("lineChart");
+      if (chartLine) chartLine.destroy();
+
+      chartLine = new Chart(getCtx("lineChart"), {
+        type: "line",
+        data: {
+          labels: data.labels,
+          datasets: [
+            {
+              label:           "Devices Online",
+              data:            data.devices_found,
+              borderColor:     C.online,
+              backgroundColor: "rgba(72,187,120,0.1)",
+              borderWidth: 2, tension: 0.4, fill: true,
+              pointRadius: 3, pointHoverRadius: 6,
+            },
+            {
+              label:       "New Devices",
+              data:        data.new_devices,
+              borderColor: C.blue,
+              backgroundColor: "rgba(99,179,237,0.1)",
+              borderWidth: 2, tension: 0.4, fill: false,
+              borderDash: [5,5], pointRadius: 3, pointHoverRadius: 6,
+            }
+          ]
+        },
+        options: chartOptions({
+          scales: {
+            x: { ticks: { maxTicksLimit: 12 } },
+            y: { beginAtZero: true, ticks: { stepSize: 1 } }
+          },
+          plugins: { tooltip: { mode: "index", intersect: false } }
+        })
+      });
+    } catch(e) {
+      setText("line-loading", "⚠️ Failed to load chart.");
+    }
+  }
+
+  // ==========================================================================
+  // B — DOUGHNUT: Device Status
+  // ==========================================================================
+  async function loadStatusChart() {
+    show("status-loading"); hide("statusChart");
+    try {
+      const data = await fetchJSON("/api/chart/device-status");
+      hide("status-loading"); show("statusChart");
+      if (chartStatus) chartStatus.destroy();
+
+      // Also update stat cards while we have the data
+      document.getElementById("stat-online").textContent  = data.data[0];
+      document.getElementById("stat-offline").textContent = data.data[1];
+      document.getElementById("stat-blocked").textContent = data.data[2];
+      document.getElementById("stat-total").textContent   = data.total;
+
+      chartStatus = new Chart(getCtx("statusChart"), {
+        type: "doughnut",
+        data: {
+          labels: data.labels,
+          datasets: [{ data: data.data,
+            backgroundColor: [C.online, C.offline, C.blocked],
+            borderWidth: 2, borderColor: C.border(), hoverOffset: 8
+          }]
+        },
+        options: doughnutOptions()
+      });
+    } catch(e) { setText("status-loading", "⚠️ Failed to load."); }
+  }
+
+  // ==========================================================================
+  // C — DOUGHNUT: Risk Breakdown
+  // ==========================================================================
+  async function loadRiskChart() {
+    show("risk-loading"); hide("riskChart");
+    try {
+      const data = await fetchJSON("/api/chart/risk-breakdown");
+      hide("risk-loading"); show("riskChart");
+      if (chartRisk) chartRisk.destroy();
+
+      // Update high-risk stat card
+      document.getElementById("stat-risk").textContent = data.data[2];
+
+      chartRisk = new Chart(getCtx("riskChart"), {
+        type: "doughnut",
+        data: {
+          labels: data.labels,
+          datasets: [{ data: data.data,
+            backgroundColor: [C.low, C.medium, C.high],
+            borderWidth: 2, borderColor: C.border(), hoverOffset: 8
+          }]
+        },
+        options: doughnutOptions()
+      });
+    } catch(e) { setText("risk-loading", "⚠️ Failed to load."); }
+  }
+
+  // ==========================================================================
+  // D — BAR CHART: Alerts by Type
+  // ==========================================================================
+  async function loadBarChart() {
+    const days = document.getElementById("bar-range").value;
+    show("bar-loading"); hide("barChart");
+    try {
+      const data = await fetchJSON(`/api/chart/alerts?days=${days}`);
+
+      if (!data.success || data.labels.length === 0) {
+        setText("bar-loading", "No alert data for this period.");
+        return;
+      }
+
+      hide("bar-loading"); show("barChart");
+      if (chartBar) chartBar.destroy();
+
+      chartBar = new Chart(getCtx("barChart"), {
+        type: "bar",
+        data: {
+          labels: data.labels,
+          datasets: [
+            { label:"New Device",      data:data.new_device,      backgroundColor:C.blue,    borderRadius:4, borderSkipped:false },
+            { label:"Blocked Attempt", data:data.blocked_attempt, backgroundColor:C.blocked, borderRadius:4, borderSkipped:false },
+            { label:"Device Offline",  data:data.device_offline,  backgroundColor:C.offline, borderRadius:4, borderSkipped:false },
+            { label:"High Risk",       data:data.high_risk,        backgroundColor:C.medium,  borderRadius:4, borderSkipped:false },
+          ]
+        },
+        options: chartOptions({
+          scales: {
+            x: { stacked:true, grid:{ display:false } },
+            y: { stacked:true, beginAtZero:true, ticks:{ stepSize:1 } }
+          }
+        })
+      });
+    } catch(e) { setText("bar-loading", "⚠️ Failed to load."); }
+  }
+
+  // ==========================================================================
+  // E — SCAN STATUS + MANUAL TRIGGER
+  // ==========================================================================
+  async function refreshScanTime() {
+    try {
+      const data = await fetchJSON("/api/scan-status");
+      const el   = document.getElementById("last-scan-time");
+      const btn  = document.getElementById("btn-scan-now");
+
+      if (data.last_scan) {
+        const diff = Math.round((Date.now() - new Date(data.last_scan)) / 1000);
+        el.textContent = diff < 60 ? `${diff}s ago`
+                       : diff < 3600 ? `${Math.round(diff/60)}m ago`
+                       : new Date(data.last_scan).toLocaleTimeString();
+      } else {
+        el.textContent = "No scan yet";
+      }
+
+      btn.disabled    = data.scan_running;
+      btn.textContent = data.scan_running ? "⏳ Scanning…" : "🔍 Scan Now";
+    } catch(e) {}
+  }
+
+  async function refreshStats() {
+    // Lightweight re-fetch for stat cards only (no full chart redraw)
+    try {
+      const data = await fetchJSON("/api/chart/device-status");
+      document.getElementById("stat-online").textContent  = data.data[0];
+      document.getElementById("stat-offline").textContent = data.data[1];
+      document.getElementById("stat-blocked").textContent = data.data[2];
+      document.getElementById("stat-total").textContent   = data.total;
+    } catch(e) {}
+  }
+
+  async function triggerManualScan() {
+    const btn = document.getElementById("btn-scan-now");
+    btn.textContent = "⏳ Starting…";
+    btn.disabled    = true;
+
+    try {
+      const data = await fetchJSON("/api/scan/trigger", "POST");
+
+      if (data.success) {
+        showToast("Scan started!", "info");
+        // Poll until the scan finishes, then refresh everything
+        const poll = setInterval(async () => {
+          const s = await fetchJSON("/api/scan-status");
+          if (!s.scan_running) {
+            clearInterval(poll);
+            loadLineChart(); loadStatusChart(); loadRiskChart(); loadBarChart();
+            refreshStats(); refreshScanTime();
+            showToast("Scan complete!", "success");
+          }
+        }, 3000);
+      } else {
+        showToast(data.message, "warning");
+        btn.disabled    = false;
+        btn.textContent = "🔍 Scan Now";
+      }
+    } catch(e) {
+      showToast("Scan trigger failed.", "error");
+      btn.disabled    = false;
+      btn.textContent = "🔍 Scan Now";
+    }
+  }
+
+  // ==========================================================================
+  // CHART HELPERS — keep chart creation code DRY
+  // ==========================================================================
+
+  // Shared base options injected into every chart
+  function chartOptions(overrides = {}) {
+    return {
+      responsive:          true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: C.text() } },
+        ...(overrides.plugins || {})
+      },
+      scales: Object.fromEntries(
+        Object.entries(overrides.scales || {}).map(([axis, cfg]) => [axis, {
+          ticks: { color: C.text(), ...(cfg.ticks||{}) },
+          grid:  { color: C.grid(), ...(cfg.grid||{}) },
+          ...cfg
+        }])
+      ),
+      ...overrides
+    };
+  }
+
+  function doughnutOptions() {
+    return {
+      responsive: true, maintainAspectRatio: false, cutout: "65%",
+      plugins: {
+        legend: { position:"bottom", labels:{ color:C.text(), padding:16 } },
+        tooltip: {
+          callbacks: {
+            label(ctx) {
+              const total = ctx.dataset.data.reduce((a,b)=>a+b,0);
+              const pct   = total > 0 ? Math.round(ctx.raw/total*100) : 0;
+              return ` ${ctx.label}: ${ctx.raw} (${pct}%)`;
+            }
+          }
+        }
+      }
+    };
+  }
+
+  // Fetch JSON helper — wraps fetch + .json() + error handling
+  async function fetchJSON(url, method = "GET") {
+    const res = await fetch(url, { method });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // DOM helpers
+  function getCtx(id) { return document.getElementById(id).getContext("2d"); }
+  function show(id)    { document.getElementById(id).style.display = "block"; }
+  function hide(id)    { document.getElementById(id).style.display = "none";  }
+  function setText(id, txt) { document.getElementById(id).textContent = txt; }
+  </script>
+
+</body>
+</html>

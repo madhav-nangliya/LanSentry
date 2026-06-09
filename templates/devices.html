@@ -1,519 +1,418 @@
-{% extends "base.html" %}
-
-{% block title %}Devices — LanSentry{% endblock %}
-
-{% block content %}
+<!DOCTYPE html>
 <!--
-  devices.html — LanSentry Device Management Page
-  ================================================
-  This page shows every device the scanner has ever found.
-  Data comes from the MySQL 'devices' table (persistent — includes
-  offline devices, not just the current scan).
+  devices.html — LanSentry Device Manager
+  ════════════════════════════════════════════════════════════════
+  No Jinja2. The device table is built entirely by JavaScript
+  after the page loads, using data from GET /api/devices.
 
-  HOW IT WORKS:
-  1. Flask renders the HTML shell with Jinja2 (server-side, one time)
-  2. On load, JavaScript calls GET /api/devices and renders the table
-  3. Every 30 seconds it auto-refreshes via the same endpoint
-  4. Block/Unblock buttons call POST /api/devices/<mac>/block
+  Block / Unblock uses POST /api/devices/<mac>/block with a JSON body.
 
-  INTERVIEW: Why not render the table rows in Jinja2?
-  → If we did, the page would go stale immediately (scanner runs every 60s).
-    Fetching via JavaScript lets us update just the table without a full
-    page reload. This is the API-first pattern.
+  Security note:
+    All device data (hostname, vendor etc.) is passed through escapeHTML()
+    before being inserted into innerHTML. This prevents a device on the
+    network from injecting HTML/JS via a malicious hostname.
+  ════════════════════════════════════════════════════════════════
 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Devices — LanSentry</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
 
-<div class="page-header">
-  <div>
-    <div class="breadcrumb">LanSentry / <span>Devices</span></div>
-    <h2>Connected Devices</h2>
-    <p>All devices detected on your network — including offline history</p>
-  </div>
-  <div class="header-actions">
-    <!-- Filter chips — filters are applied client-side in renderTable() -->
-    <div class="filter-chips" id="filter-chips">
-      <button class="chip chip-active" data-filter="all"     onclick="setFilter('all')">All</button>
-      <button class="chip"             data-filter="online"  onclick="setFilter('online')">🟢 Online</button>
-      <button class="chip"             data-filter="offline" onclick="setFilter('offline')">⚫ Offline</button>
-      <button class="chip"             data-filter="blocked" onclick="setFilter('blocked')">🚫 Blocked</button>
-      <button class="chip chip-danger" data-filter="high"    onclick="setFilter('high')">⚠️ High Risk</button>
-    </div>
-  </div>
-</div>
-
-<!-- Main panel -->
-<div class="panel">
-
-  <!-- Panel header: title + search + scan button -->
-  <div class="panel-header">
-    <div class="panel-title">
-      <div class="dot"></div>
-      Live Device List
-      <!-- Device count badge — updated by JS after fetch -->
-      <span class="count-badge" id="device-count-badge">–</span>
-    </div>
-    <div class="panel-actions">
-      <div class="search-bar">
-        <span class="search-icon" aria-hidden="true">🔍</span>
-        <!--
-          Search input — listens for 'input' event (fires on every keystroke).
-          We filter the already-fetched allDevices array — no extra API calls.
-          INTERVIEW: Client-side filtering is instant and free. We only need
-          a server-side search endpoint if the dataset is too large to hold
-          in memory (thousands of rows). For a LAN scanner, client-side is fine.
-        -->
-        <input
-          type="text"
-          id="search-input"
-          placeholder="Search IP, hostname, MAC, vendor…"
-          autocomplete="off"
-          aria-label="Search devices"
-        />
-        <!-- Clear button — appears when search has text -->
-        <button class="search-clear" id="search-clear" onclick="clearSearch()" style="display:none" aria-label="Clear search">×</button>
+  <!-- ── NAVBAR ── -->
+  <nav class="navbar">
+    <a class="navbar-brand" href="/">
+      <div class="logo-icon">🛡️</div>
+      <h1>Lan<span>Sentry</span></h1>
+    </a>
+    <ul class="nav-links">
+      <li><a href="/"        id="nav-home">🏠 Home</a></li>
+      <li><a href="/devices" id="nav-devices">📡 Devices</a></li>
+      <li><a href="/alerts"  id="nav-alerts">
+        🚨 Alerts
+        <span class="alert-badge" id="alert-badge" style="display:none">0</span>
+      </a></li>
+    </ul>
+    <div class="nav-right">
+      <div class="network-status">
+        <div class="status-dot"></div>
+        <span>Network Active</span>
       </div>
-      <button class="btn btn-primary" id="refresh-btn" onclick="manualScan()">
-        <span class="btn-icon" aria-hidden="true">🔄</span> Scan Now
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">
+        <div class="toggle-knob" id="toggle-knob">🌙</div>
+      </button>
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span><span></span><span></span>
       </button>
     </div>
+  </nav>
+  <div class="mobile-nav" id="mobile-nav">
+    <a href="/">🏠 Home</a>
+    <a href="/devices">📡 Devices</a>
+    <a href="/alerts">🚨 Alerts</a>
   </div>
 
-  <!-- Scan progress bar — shown while a scan is running -->
-  <div class="scan-progress" id="scan-progress" role="status" aria-live="polite">
-    <div class="progress-bar"><div class="progress-fill"></div></div>
-    <div class="progress-text">Scanning network…</div>
-  </div>
+  <!-- ── MAIN CONTENT ── -->
+  <div class="container">
 
-  <!-- Device table -->
-  <div class="table-wrapper" role="region" aria-label="Device list" aria-live="polite">
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>IP Address</th>
-          <th>Hostname / Vendor</th>
-          <th>MAC Address</th>
-          <th>Open Ports</th>
-          <th>Risk</th>
-          <th>Status</th>
-          <th>Last Seen</th>
-          <th>Action</th>
-        </tr>
-      </thead>
-      <tbody id="device-table-body">
-        <!-- Populated entirely by JavaScript — see renderTable() below -->
-        <tr>
-          <td colspan="9">
-            <div class="empty-state">
-              <div class="empty-icon">⏳</div>
-              <p>Loading devices…</p>
-            </div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <!-- Panel footer: last-updated + next-scan countdown -->
-  <div class="panel-footer">
-    <div class="update-info">
-      <div class="live-dot"></div>
-      <span id="last-updated">Loading…</span>
+    <div class="page-header">
+      <div class="breadcrumb">LanSentry / <span>Devices</span></div>
+      <h2>Connected Devices</h2>
+      <p>All devices ever detected on your local network</p>
     </div>
-    <span class="next-scan" id="next-scan-text">Connecting…</span>
-  </div>
 
-</div><!-- /panel -->
-{% endblock %}
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <div class="dot"></div>
+          Live Device List
+        </div>
+        <div class="panel-actions">
+          <div class="search-bar">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="search-input" placeholder="Search IP, hostname, MAC…" />
+          </div>
+          <button class="btn btn-primary" id="refresh-btn" onclick="triggerScan()">
+            <span id="refresh-icon">🔄</span> Scan Now
+          </button>
+        </div>
+      </div>
 
+      <!-- Scan progress bar — shown while a scan is running -->
+      <div class="scan-progress" id="scan-progress">
+        <div class="progress-bar"><div class="progress-fill"></div></div>
+        <div class="progress-text">Scanning network…</div>
+      </div>
 
-{% block scripts %}
-<script>
-// ═══════════════════════════════════════════════════════════════════════
-// devices.js — Device table logic
-// ═══════════════════════════════════════════════════════════════════════
+      <!-- Device table — tbody filled by renderTable() -->
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>IP Address</th>
+              <th>Hostname</th>
+              <th>MAC Address</th>
+              <th>Vendor</th>
+              <th>Risk</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="device-tbody">
+            <!-- Rows injected by renderTable() -->
+            <tr><td colspan="8">
+              <div class="empty-state">
+                <div class="empty-icon">📡</div>
+                <p>Loading devices…</p>
+              </div>
+            </td></tr>
+          </tbody>
+        </table>
+      </div>
 
-// ── State ──────────────────────────────────────────────────────────────
-// allDevices holds the full unfiltered list from the last API fetch.
-// We filter/search this array in memory — no re-fetch needed.
-let allDevices    = [];
-let activeFilter  = 'all';     // Current filter chip selection
-let refreshTimer  = null;      // setInterval handle for countdown
-let countdown     = 30;        // Seconds until next auto-refresh
+      <div class="panel-footer">
+        <div class="update-info">
+          <div class="live-dot"></div>
+          <span id="last-updated">Loading…</span>
+        </div>
+        <span class="next-scan" id="next-scan-text">Next refresh in 30s</span>
+      </div>
+    </div>
 
+  </div><!-- /container -->
 
-// ── HELPERS ─────────────────────────────────────────────────────────────
+  <div class="toast-container" id="toast-container"></div>
 
-/**
- * timeAgo(isoString) — converts an ISO datetime string to a human-readable
- * relative time like "2m ago" or "just now".
- * INTERVIEW: We do this client-side because the server doesn't know the
- * user's timezone, and we want the time relative to NOW (which changes).
- */
-function timeAgo(isoStr) {
-  if (!isoStr) return '—';
-  const diff = Math.floor((Date.now() - new Date(isoStr)) / 1000);   // seconds
-  if (diff < 5)    return 'just now';
-  if (diff < 60)   return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400)return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
+  <!-- ── JAVASCRIPT ── -->
+  <script>
+  // ── Global utilities ──────────────────────────────────────────────────────
 
-/**
- * riskBadge(level) — returns the HTML string for a risk badge.
- * Using a function keeps renderTable() clean.
- */
-function riskBadge(level) {
-  const map = {
-    high:   ['badge-danger',  '⚠️ High'],
-    medium: ['badge-warning', '🔶 Med'],
-    low:    ['badge-success', '✅ Low'],
-  };
-  const [cls, label] = map[level] || ['badge-muted', '— —'];
-  return `<span class="badge ${cls}">${label}</span>`;
-}
+  (function() {
+    if (localStorage.getItem("lansentry-theme") === "light")
+      document.body.classList.add("light-mode");
+  })();
 
-/**
- * statusBadge(status) — returns the HTML string for a status badge.
- */
-function statusBadge(status) {
-  const map = {
-    online:  'badge-online',
-    offline: 'badge-offline',
-    blocked: 'badge-warning',
-  };
-  const cls   = map[status] || 'badge-muted';
-  const label = status ? (status.charAt(0).toUpperCase() + status.slice(1)) : '—';
-  const dot   = status === 'online' ? '<span class="badge-dot"></span>' : '';
-  return `<span class="badge ${cls}">${dot}${label}</span>`;
-}
-
-/**
- * formatPorts(portStr) — turns "22,80,443" into styled port pills.
- * Limits display to first 5 ports with a "+N more" indicator.
- */
-function formatPorts(portStr) {
-  if (!portStr) return '<span style="color:var(--text-muted)">—</span>';
-  const ports = portStr.split(',').filter(Boolean);
-  const shown = ports.slice(0, 4);
-  const extra = ports.length - shown.length;
-  let html = shown.map(p => `<span class="port-pill">${escapeHTML(p)}</span>`).join('');
-  if (extra > 0) html += `<span class="port-pill port-pill-more">+${extra}</span>`;
-  return html;
-}
-
-
-// ── FILTER CHIPS ────────────────────────────────────────────────────────
-
-/**
- * setFilter(filter) — changes which subset of devices is shown.
- * Updates the active chip styling and re-renders the table.
- * No API call needed — we just filter allDevices in memory.
- */
-function setFilter(filter) {
-  activeFilter = filter;
-
-  // Update chip appearances
-  document.querySelectorAll('.chip').forEach(chip => {
-    chip.classList.toggle('chip-active', chip.dataset.filter === filter);
-  });
-
-  applyFiltersAndRender();
-}
-
-/**
- * applyFiltersAndRender() — combines the active filter chip + search query,
- * then calls renderTable() with the result.
- */
-function applyFiltersAndRender() {
-  const query = document.getElementById('search-input').value.toLowerCase().trim();
-
-  let filtered = allDevices;
-
-  // 1. Apply status/risk filter
-  if (activeFilter !== 'all') {
-    if (activeFilter === 'high') {
-      filtered = filtered.filter(d => d.risk_level === 'high');
-    } else {
-      filtered = filtered.filter(d => d.status === activeFilter);
-    }
+  function toggleTheme() {
+    document.body.classList.toggle("light-mode");
+    const isLight = document.body.classList.contains("light-mode");
+    document.getElementById("toggle-knob").textContent = isLight ? "☀️" : "🌙";
+    localStorage.setItem("lansentry-theme", isLight ? "light" : "dark");
   }
 
-  // 2. Apply search query across multiple fields
-  if (query) {
-    filtered = filtered.filter(d =>
-      (d.ip        || '').toLowerCase().includes(query) ||
-      (d.hostname  || '').toLowerCase().includes(query) ||
-      (d.mac       || '').toLowerCase().includes(query) ||
-      (d.vendor    || '').toLowerCase().includes(query)
-    );
+  function escapeHTML(str) {
+    if (str == null) return "";
+    const el = document.createElement("div");
+    el.textContent = String(str);
+    return el.innerHTML;
   }
 
-  renderTable(filtered);
-}
+  function showToast(msg, type = "info", duration = 3500) {
+    const icons = { success:"✅", error:"❌", info:"ℹ️", warning:"⚠️" };
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `<span>${icons[type]||"ℹ️"}</span><span>${escapeHTML(msg)}</span>`;
+    document.getElementById("toast-container").appendChild(toast);
+    setTimeout(() => {
+      toast.style.animation = "toastOut 0.3s ease forwards";
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
 
+  function updateAlertBadge() {
+    fetch("/api/alerts/unread-count")
+      .then(r => r.json())
+      .then(data => {
+        const badge = document.getElementById("alert-badge");
+        if (data.count > 0) {
+          badge.textContent = data.count;
+          badge.style.display = "inline";
+        } else {
+          badge.style.display = "none";
+        }
+      }).catch(() => {});
+  }
 
-// ── SEARCH ──────────────────────────────────────────────────────────────
+  // ── Page state ────────────────────────────────────────────────────────────
 
-document.getElementById('search-input').addEventListener('input', function () {
-  // Show/hide the ✕ clear button
-  document.getElementById('search-clear').style.display = this.value ? 'block' : 'none';
-  applyFiltersAndRender();
-});
+  let allDevices = [];   // Full list from last API response
+  let countdown  = 30;  // Seconds until next auto-refresh
 
-function clearSearch() {
-  document.getElementById('search-input').value = '';
-  document.getElementById('search-clear').style.display = 'none';
-  applyFiltersAndRender();
-}
+  // ── Render table ──────────────────────────────────────────────────────────
+  // Builds HTML rows from an array of device objects.
+  // EVERY field goes through escapeHTML() — never trust data from the network.
 
+  function renderTable(devices) {
+    const tbody = document.getElementById("device-tbody");
 
-// ── RENDER TABLE ─────────────────────────────────────────────────────────
-
-/**
- * renderTable(devices) — takes an array of device objects and builds
- * the <tbody> rows via innerHTML.
- *
- * SECURITY: We call escapeHTML() on every piece of device data before
- * inserting it into innerHTML.
- * INTERVIEW: Why not use textContent?
- * → We need some HTML (badges, port pills). The safe pattern is:
- *   use escapeHTML() on untrusted data, literal HTML for trusted markup.
- */
-function renderTable(devices) {
-  const tbody = document.getElementById('device-table-body');
-
-  if (!devices || devices.length === 0) {
-    tbody.innerHTML = `
-      <tr><td colspan="9">
+    if (devices.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="8">
         <div class="empty-state">
           <div class="empty-icon">📡</div>
-          <p>No devices match your search or filter.</p>
+          <p>No devices found on the network.</p>
         </div>
       </td></tr>`;
-    return;
-  }
-
-  tbody.innerHTML = devices.map((d, i) => {
-    const mac      = escapeHTML(d.mac      || '—');
-    const ip       = escapeHTML(d.ip       || '—');
-    const hostname = escapeHTML(d.hostname || 'Unknown');
-    const vendor   = escapeHTML(d.vendor   || 'Unknown');
-
-    // Build the action button based on current status
-    // is_blocked comes from the DB column (different from old 'blocked' field)
-    let actionBtn;
-    if (d.is_blocked) {
-      actionBtn = `
-        <button class="btn btn-outline btn-sm"
-          onclick="toggleBlock('${mac}', false)"
-          aria-label="Unblock ${ip}">
-          ✅ Unblock
-        </button>`;
-    } else if (d.status === 'offline') {
-      // Can't block an offline device (would be confusing)
-      actionBtn = `<span class="action-na">—</span>`;
-    } else {
-      actionBtn = `
-        <button class="btn btn-danger btn-sm"
-          onclick="toggleBlock('${mac}', true)"
-          aria-label="Block ${ip}">
-          🚫 Block
-        </button>`;
-    }
-
-    // Row gets a CSS class based on status for row-level colour coding
-    const rowClass = d.is_blocked ? 'row-blocked'
-                   : d.status === 'offline' ? 'row-offline'
-                   : d.risk_level === 'high' ? 'row-high-risk'
-                   : '';
-
-    return `
-      <tr class="${rowClass}" data-mac="${mac}">
-        <td class="td-mono" style="color:var(--text-muted)">${i + 1}</td>
-        <td class="td-mono td-ip">${ip}</td>
-        <td class="td-hostname">
-          <div class="device-name">${hostname !== 'Unknown' ? hostname : vendor}</div>
-          ${hostname !== 'Unknown' && vendor !== 'Unknown'
-            ? `<div class="device-vendor">${vendor}</div>`
-            : ''}
-        </td>
-        <td class="td-mono td-mac">${mac}</td>
-        <td class="td-ports">${formatPorts(d.open_ports)}</td>
-        <td>${riskBadge(d.risk_level)}</td>
-        <td>${statusBadge(d.status)}</td>
-        <td class="td-mono td-time" title="${escapeHTML(d.last_seen || '')}">${timeAgo(d.last_seen)}</td>
-        <td>${actionBtn}</td>
-      </tr>`;
-  }).join('');
-}
-
-
-// ── BLOCK / UNBLOCK ──────────────────────────────────────────────────────
-
-/**
- * toggleBlock(mac, block) — calls POST /api/devices/<mac>/block
- *
- * WHY POST not GET?
- * → GET requests should be safe (no side effects) and idempotent.
- *   Blocking a device changes server state, so POST is correct HTTP semantics.
- *   Using GET for state-changing actions also makes them vulnerable to
- *   CSRF via <img src="..."> tags. POST with Content-Type: application/json
- *   is much harder to forge cross-site.
- *
- * INTERVIEW: What is CSRF?
- * → Cross-Site Request Forgery. A malicious page tricks your browser into
- *   making a GET request to your app, which executes if you're logged in.
- *   Flask-WTF adds CSRF tokens for form submissions. For pure JSON APIs
- *   (application/json), browsers block cross-origin reads via CORS,
- *   making CSRF impractical.
- */
-async function toggleBlock(mac, block) {
-  const action = block ? 'block' : 'unblock';
-  if (!confirm(`${block ? 'Block' : 'Unblock'} device ${mac}?\n\n${block ? 'This will cut off network access.' : 'This will restore network access.'}`)) return;
-
-  showToast(`${block ? 'Blocking' : 'Unblocking'} ${mac}…`, 'info', 1500);
-
-  try {
-    const res = await fetch(`/api/devices/${encodeURIComponent(mac)}/block`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ blocked: block }),
-    });
-    const data = await res.json();
-
-    if (data.success) {
-      showToast(`${mac} ${action}ed successfully`, 'success');
-      await fetchDevices();   // Refresh table to show new status
-    } else {
-      showToast(`Failed: ${data.message}`, 'error');
-    }
-  } catch (err) {
-    showToast('Network error — could not reach server', 'error');
-    console.error('toggleBlock error:', err);
-  }
-}
-
-
-// ── FETCH DEVICES FROM API ───────────────────────────────────────────────
-
-/**
- * fetchDevices() — GET /api/devices, update allDevices, re-render.
- * Called on page load, on manual scan, and every 30 seconds.
- */
-async function fetchDevices() {
-  try {
-    const res  = await fetch('/api/devices');
-    const data = await res.json();
-
-    if (!data.success) throw new Error(data.message || 'API error');
-
-    allDevices = data.devices;
-
-    // Update device count badge in panel header
-    document.getElementById('device-count-badge').textContent = data.count;
-
-    // Update last-updated timestamp
-    const now = new Date();
-    document.getElementById('last-updated').textContent =
-      'Updated at ' + now.toLocaleTimeString();
-
-    applyFiltersAndRender();
-
-  } catch (err) {
-    showToast('Failed to fetch devices', 'error');
-    console.error('fetchDevices error:', err);
-  }
-}
-
-
-// ── MANUAL SCAN ──────────────────────────────────────────────────────────
-
-/**
- * manualScan() — triggers an immediate nmap scan via POST /api/scan/trigger,
- * then polls /api/scan-status every 2 seconds until it finishes,
- * then refreshes the device table.
- *
- * WHY POLL? Nmap scans take 5–30 seconds. The HTTP request returns immediately
- * (the scan runs in a background thread). We poll to know when it's done.
- * A more advanced solution would use WebSockets for a push notification.
- */
-async function manualScan() {
-  const btn      = document.getElementById('refresh-btn');
-  const progress = document.getElementById('scan-progress');
-
-  btn.disabled  = true;
-  btn.innerHTML = '<span class="btn-icon">⏳</span> Starting…';
-  progress.classList.add('active');
-
-  try {
-    const res  = await fetch('/api/scan/trigger', { method: 'POST' });
-    const data = await res.json();
-
-    if (!data.success) {
-      showToast(data.message || 'Could not start scan', 'warning');
-      resetScanUI();
       return;
     }
 
-    btn.innerHTML = '<span class="btn-icon">🔄</span> Scanning…';
+    tbody.innerHTML = devices.map((d, i) => {
+      // ── Status badge ──
+      // status comes from the DB: 'online', 'offline', or 'blocked'
+      const statusBadge =
+        d.status === "blocked"
+          ? `<span class="badge badge-warning"><span class="badge-dot"></span>Blocked</span>`
+        : d.status === "online"
+          ? `<span class="badge badge-online"><span class="badge-dot"></span>Online</span>`
+          : `<span class="badge badge-offline"><span class="badge-dot"></span>Offline</span>`;
 
-    // Poll until scan_running becomes false
-    const pollHandle = setInterval(async () => {
-      try {
-        const s = await fetch('/api/scan-status').then(r => r.json());
-        if (!s.scan_running) {
-          clearInterval(pollHandle);
-          await fetchDevices();
-          showToast(`Scan complete — ${allDevices.length} device(s) found`, 'success');
-          resetScanUI();
-        }
-      } catch {
-        clearInterval(pollHandle);
-        resetScanUI();
+      // ── Risk badge ──
+      const riskColour = d.risk_level === "high"   ? "var(--danger)"
+                       : d.risk_level === "medium" ? "var(--warning)"
+                       : "var(--success)";
+      const riskBadge = `<span style="
+          display:inline-block; padding:3px 8px; border-radius:20px;
+          font-size:11px; font-weight:700;
+          background: ${riskColour}22; color: ${riskColour};
+          border: 1px solid ${riskColour}44;">
+          ${escapeHTML(d.risk_level || "low")}
+        </span>`;
+
+      // ── Action button ──
+      // We use data-mac attribute to pass the MAC to the click handler.
+      // This avoids building onclick strings with user data inside them
+      // (which could be an XSS vector if MAC somehow contained quotes).
+      const isBlocked = d.status === "blocked" || d.is_blocked;
+      const actionBtn = isBlocked
+        ? `<button class="btn btn-outline"
+               style="padding:5px 12px;font-size:12px;"
+               data-mac="${escapeHTML(d.mac)}"
+               data-action="unblock"
+               onclick="handleBlockClick(this)">
+             ✅ Unblock
+           </button>`
+        : `<button class="btn"
+               style="padding:5px 12px;font-size:12px;
+                      background:var(--danger-bg);color:var(--danger);
+                      border:1px solid var(--danger);"
+               data-mac="${escapeHTML(d.mac)}"
+               data-action="block"
+               onclick="handleBlockClick(this)">
+             🚫 Block
+           </button>`;
+
+      // ── Format last_seen ──
+      let lastSeen = "—";
+      if (d.last_seen) {
+        const diff = Math.round((Date.now() - new Date(d.last_seen)) / 1000);
+        lastSeen = diff < 60 ? `${diff}s ago`
+                 : diff < 3600 ? `${Math.round(diff/60)}m ago`
+                 : new Date(d.last_seen).toLocaleTimeString();
       }
-    }, 2000);   // Check every 2 seconds
 
-  } catch (err) {
-    showToast('Scan trigger failed', 'error');
-    resetScanUI();
+      return `<tr>
+        <td class="td-mono" style="color:var(--text-muted);">${i + 1}</td>
+        <td class="td-mono">${escapeHTML(d.ip)}</td>
+        <td class="td-hostname">${escapeHTML(d.hostname || "Unknown")}</td>
+        <td class="td-mono">${escapeHTML(d.mac)}</td>
+        <td style="color:var(--text-secondary);font-size:12px;">${escapeHTML(d.vendor || "Unknown")}</td>
+        <td>${riskBadge}</td>
+        <td>${statusBadge}</td>
+        <td>${actionBtn}</td>
+      </tr>`;
+    }).join("");
   }
-}
 
-function resetScanUI() {
-  const btn = document.getElementById('refresh-btn');
-  btn.disabled  = false;
-  btn.innerHTML = '<span class="btn-icon">🔄</span> Scan Now';
-  document.getElementById('scan-progress').classList.remove('active');
-}
+  // ── Fetch and refresh device list ─────────────────────────────────────────
 
+  async function loadDevices(isManual = false) {
+    try {
+      const data = await fetch("/api/devices").then(r => r.json());
 
-// ── AUTO-REFRESH COUNTDOWN ───────────────────────────────────────────────
-
-/**
- * Start a 30-second countdown that auto-refreshes the device list.
- * We show the countdown in the footer so users know when to expect fresh data.
- */
-function startCountdown() {
-  countdown = 30;
-  clearInterval(refreshTimer);
-
-  refreshTimer = setInterval(() => {
-    countdown--;
-    document.getElementById('next-scan-text').textContent =
-      `Auto-refresh in ${countdown}s`;
-
-    if (countdown <= 0) {
-      fetchDevices();
+      allDevices = data.devices || [];
+      renderTable(allDevices);
       countdown = 30;
+
+      const now = new Date();
+      document.getElementById("last-updated").textContent =
+        `Updated at ${now.toLocaleTimeString()} — ${allDevices.length} device(s)`;
+
+      if (isManual) showToast(`Found ${allDevices.length} device(s)`, "success");
+    } catch(e) {
+      showToast("Failed to load devices.", "error");
     }
-  }, 1000);
-}
+  }
 
+  // ── Block / Unblock ───────────────────────────────────────────────────────
+  // Called via onclick="handleBlockClick(this)" on the buttons in renderTable().
+  // 'this' = the button element; we read data-mac and data-action attributes.
 
-// ── INITIALISE ────────────────────────────────────────────────────────────
+  async function handleBlockClick(btn) {
+    const mac    = btn.dataset.mac;
+    const action = btn.dataset.action;  // "block" or "unblock"
+    const label  = action === "block" ? "Block" : "Unblock";
 
-// Fetch devices immediately when the page loads, then start the countdown.
-fetchDevices().then(() => startCountdown());
-</script>
-{% endblock %}
+    if (!confirm(`${label} device ${mac}?`)) return;
+
+    // Disable button while request is in flight (prevents double-clicks)
+    btn.disabled    = true;
+    btn.textContent = "⏳…";
+
+    try {
+      const res = await fetch(`/api/devices/${encodeURIComponent(mac)}/block`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        // Send blocked:true to block, false to unblock
+        body: JSON.stringify({ blocked: action === "block" })
+      });
+
+      const data = await res.json();
+
+      if (data.success) {
+        showToast(data.message, "success");
+        await loadDevices();  // Refresh table to show new status
+      } else {
+        showToast(data.message || "Action failed.", "error");
+        btn.disabled    = false;
+        btn.textContent = action === "block" ? "🚫 Block" : "✅ Unblock";
+      }
+    } catch(e) {
+      showToast("Network error.", "error");
+      btn.disabled    = false;
+      btn.textContent = action === "block" ? "🚫 Block" : "✅ Unblock";
+    }
+  }
+
+  // ── Manual scan trigger ───────────────────────────────────────────────────
+
+  async function triggerScan() {
+    const btn  = document.getElementById("refresh-btn");
+    const icon = document.getElementById("refresh-icon");
+    const prog = document.getElementById("scan-progress");
+
+    btn.disabled        = true;
+    icon.style.animation = "spin 1s linear infinite";
+    prog.classList.add("active");
+
+    try {
+      const data = await fetch("/api/scan/trigger", { method:"POST" }).then(r=>r.json());
+
+      if (data.success) {
+        showToast("Scan started…", "info");
+        // Poll until scan finishes, then refresh the device list
+        const poll = setInterval(async () => {
+          const s = await fetch("/api/scan-status").then(r=>r.json());
+          if (!s.scan_running) {
+            clearInterval(poll);
+            await loadDevices(true);
+            btn.disabled         = false;
+            icon.style.animation = "";
+            prog.classList.remove("active");
+          }
+        }, 2000);
+      } else {
+        showToast(data.message, "warning");
+        btn.disabled         = false;
+        icon.style.animation = "";
+        prog.classList.remove("active");
+      }
+    } catch(e) {
+      showToast("Scan failed.", "error");
+      btn.disabled         = false;
+      icon.style.animation = "";
+      prog.classList.remove("active");
+    }
+  }
+
+  // ── Live search filter ────────────────────────────────────────────────────
+  // Filters the LOCAL allDevices array — no extra API calls needed.
+
+  document.addEventListener("DOMContentLoaded", () => {
+    // Apply theme
+    if (document.body.classList.contains("light-mode"))
+      document.getElementById("toggle-knob").textContent = "☀️";
+
+    // Active nav
+    document.getElementById("nav-devices").classList.add("active");
+
+    // Hamburger
+    document.getElementById("hamburger").addEventListener("click", () =>
+      document.getElementById("mobile-nav").classList.toggle("open")
+    );
+
+    // Alert badge
+    updateAlertBadge();
+    setInterval(updateAlertBadge, 30_000);
+
+    // Search filter
+    document.getElementById("search-input").addEventListener("input", function() {
+      const q = this.value.toLowerCase();
+      const filtered = allDevices.filter(d =>
+        (d.ip       || "").toLowerCase().includes(q) ||
+        (d.hostname || "").toLowerCase().includes(q) ||
+        (d.mac      || "").toLowerCase().includes(q) ||
+        (d.vendor   || "").toLowerCase().includes(q)
+      );
+      renderTable(filtered);
+    });
+
+    // Initial load
+    loadDevices();
+
+    // Auto-refresh countdown
+    setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        loadDevices();
+        countdown = 30;
+      }
+      document.getElementById("next-scan-text").textContent =
+        `Next refresh in ${countdown}s`;
+    }, 1000);
+  });
+  </script>
+
+</body>
+</html>

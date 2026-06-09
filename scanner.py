@@ -1,22 +1,31 @@
 # =============================================================================
 # scanner.py — LanSentry Network Scanner
 # =============================================================================
-# Runs nmap scans in a background thread, persists results to MySQL,
-# and maintains an in-memory cache for fast API responses.
 #
-# FLOW:
-#   startup (app.py)
-#     → start_background_scanner()
-#       → _background_scan_loop() [daemon thread]
-#         → run_scan() every SCAN_INTERVAL seconds
-#           → nmap → upsert_device → mark_devices_offline
-#           → create_alert (new devices, blocked attempts, offline)
-#           → save_scan_result → update scan_cache
+# HOW SCANNING WORKS (important for interviews):
 #
-# INTERVIEW: What is a daemon thread?
-# → A thread marked daemon=True is automatically killed when the main
-#   process exits. Without daemon=True, Python would wait for the thread
-#   to finish before exiting, which would make Ctrl+C not work.
+#   We use TWO complementary discovery methods:
+#
+#   Method 1 — ARP scan (via nmap -PR)
+#     ARP (Address Resolution Protocol) maps IP addresses to MAC addresses
+#     on a local network. Every device MUST respond to ARP requests (it's
+#     how TCP/IP works at the Ethernet level), so ARP scanning is:
+#       • Near-instant (milliseconds per device)
+#       • 100% reliable on local subnets
+#       • Works WITHOUT Administrator rights on Windows
+#       • Only works on the LOCAL subnet (can't cross routers)
+#
+#   Method 2 — TCP ping fallback (via nmap -PS80,443 -PA80)
+#     If ARP returns nothing (e.g. VPN or unusual network config), we fall
+#     back to TCP-based host discovery. This tries to connect to port 80/443
+#     — if the port is open OR the device sends a TCP RST (port closed),
+#     nmap marks the host as "up". This doesn't require raw ICMP.
+#
+#   Why NOT plain "nmap -sn" (ICMP ping)?
+#     Windows blocks raw ICMP socket creation for non-Administrator processes.
+#     nmap silently returns 0 hosts instead of an error. This is the #1 reason
+#     LAN scanners appear "broken" on Windows but work fine on Linux.
+#
 # =============================================================================
 
 import nmap
@@ -25,6 +34,8 @@ import threading
 import time
 import logging
 import ipaddress
+import subprocess
+import re
 from datetime import datetime
 
 from database import (
@@ -38,34 +49,34 @@ from database import (
 
 logger = logging.getLogger("scanner")
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # CONFIGURATION
-# ---------------------------------------------------------------------------
-SCAN_INTERVAL   = 60      # Seconds between automatic scans
-SCAN_TIMEOUT    = 30      # Max seconds nmap waits per host
-NMAP_ARGUMENTS  = "-sn"   # Ping scan: discover hosts without port scanning
-                           # Add "-O" for OS detection (requires root/sudo)
-                           # Add "-sV -p 1-1024" for service detection (much slower)
+# =============================================================================
 
-# In-memory cache — app.py reads from here for instant responses
-# without a DB query on every poll.
+SCAN_INTERVAL = 60       # Seconds between background scans
+SCAN_TIMEOUT  = 120      # Hard timeout for the entire nmap run (seconds)
+
+# Nmap arguments explained:
+#   -sn          : host discovery only, no port scan
+#   -PR          : ARP ping — most reliable on local LAN, no admin needed
+#   -PS80,443    : TCP SYN to port 80 + 443 as fallback
+#   -PA80        : TCP ACK to port 80 as another fallback
+#   --host-timeout 5s : skip any single host that doesn't respond in 5 seconds
+#   -T4          : aggressive timing (faster scans, fine on a LAN)
+NMAP_ARGS_PRIMARY  = "-sn -PR -PS80,443 -PA80 --host-timeout 5s -T4"
+
+# Fallback: pure TCP connect (slowest but works in every environment)
+NMAP_ARGS_FALLBACK = "-sn -PS21,22,80,443,8080 -PA80,443 --host-timeout 8s -T3"
+
 scan_cache = {
-    "devices":      [],     # List of device dicts from the latest scan
-    "last_scan":    None,   # datetime of last completed scan
-    "scan_running": False,  # True while nmap is running
-    "total_scans":  0,      # Lifetime scan count (since startup)
-    "last_error":   None,   # Last error string or None
-    "subnet":       "",     # Which subnet was last scanned
+    "devices":      [],
+    "last_scan":    None,
+    "scan_running": False,
+    "total_scans":  0,
+    "last_error":   None,
+    "subnet":       "",
 }
 
-# Thread lock: prevents a race condition where the background thread
-# writes to scan_cache at the same time app.py reads it.
-# INTERVIEW: What is a race condition?
-# → Two threads read and write shared data concurrently in a way that
-#   produces incorrect results. Example: thread A reads scan_running=False,
-#   thread B sets it to True, thread A then starts a second scan because it
-#   thinks none is running. The lock prevents this by making the read-check
-#   and the write atomic (one thread at a time).
 cache_lock = threading.Lock()
 
 
@@ -75,93 +86,202 @@ cache_lock = threading.Lock()
 
 def detect_subnet():
     """
-    Finds the local network's CIDR (e.g. "192.168.1.0/24") by inspecting
-    active network interfaces via psutil.
-    Falls back to "192.168.1.0/24" if detection fails.
+    Find the best subnet to scan by inspecting network interfaces.
 
-    INTERVIEW: What is a CIDR?
-    → Classless Inter-Domain Routing. "192.168.1.0/24" means:
-      • Network: 192.168.1.0
-      • /24 = 24-bit mask = 255.255.255.0
-      • Host range: 192.168.1.1 – 192.168.1.254 (254 addresses)
-      nmap scans all addresses in this range.
+    Windows-specific pitfalls we handle:
+      • 169.254.x.x (APIPA): Windows auto-assigns this when no DHCP server
+        responds. The interface is technically "up" but has no real devices.
+      • Multiple interfaces: A laptop often has Ethernet (unplugged) +
+        WiFi (connected) + VPN adapters. We must pick the right one.
+      • Large subnets: A /8 has 16 million addresses — scanning it would
+        take hours. We cap at /16 (65,534 addresses).
+
+    Scoring system:
+      We score every candidate and return the best one.
+      Private RFC 1918 ranges (10.x, 192.168.x, 172.16-31.x) score highest
+      because they are LAN subnets. Smaller prefix length = smaller network
+      = faster scan, so /24 beats /16.
     """
     try:
-        for iface_name, addrs in psutil.net_if_addrs().items():
-            if "lo" in iface_name.lower():
-                continue   # Skip loopback (127.x.x.x)
-            for addr in addrs:
-                if addr.family == 2 and addr.address and addr.netmask:
-                    if addr.address.startswith("127."):
-                        continue
-                    network = ipaddress.ip_network(
-                        f"{addr.address}/{addr.netmask}", strict=False
-                    )
-                    subnet = str(network)
-                    logger.info("Detected subnet: %s (via %s)", subnet, iface_name)
-                    return subnet
-    except Exception as err:
-        logger.warning("Subnet detection failed: %s", err)
+        candidates = []
 
-    logger.warning("Using fallback subnet 192.168.1.0/24")
+        for iface_name, iface_addresses in psutil.net_if_addrs().items():
+            # Skip loopback interfaces entirely
+            if iface_name.lower() in ("lo", "loopback pseudo-interface 1"):
+                continue
+            if "loopback" in iface_name.lower():
+                continue
+
+            for addr in iface_addresses:
+                # We only want IPv4 (family=2 = AF_INET)
+                if addr.family != 2:
+                    continue
+                if not addr.address or not addr.netmask:
+                    continue
+
+                ip   = addr.address
+                mask = addr.netmask
+
+                # Skip loopback range
+                if ip.startswith("127."):
+                    continue
+
+                # ── CRITICAL WINDOWS FIX ──
+                # 169.254.x.x = APIPA (Automatic Private IP Addressing)
+                # Windows assigns these to disconnected interfaces.
+                # There are zero real devices behind this address.
+                if ip.startswith("169.254."):
+                    logger.debug("Skipping APIPA address %s on '%s'", ip, iface_name)
+                    continue
+
+                try:
+                    network = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+                except ValueError:
+                    continue
+
+                # Skip subnets too large to scan meaningfully
+                if network.prefixlen < 16:
+                    logger.debug("Skipping huge subnet %s on '%s'", network, iface_name)
+                    continue
+
+                # Score this candidate:
+                #   is_private: 1 if RFC 1918 (real LAN), 0 if public/unusual
+                #   prefixlen:  larger = smaller network = faster scan (preferred)
+                is_private = network.is_private
+                score = (int(is_private), network.prefixlen)
+
+                candidates.append({
+                    "score":   score,
+                    "subnet":  str(network),
+                    "iface":   iface_name,
+                    "ip":      ip,
+                })
+                logger.debug("Candidate: %s via '%s' score=%s", network, iface_name, score)
+
+        if candidates:
+            # Best = highest score (private first, then smallest subnet)
+            best = max(candidates, key=lambda c: c["score"])
+            logger.info(
+                "Selected subnet: %s  (interface: '%s',  IP: %s)",
+                best["subnet"], best["iface"], best["ip"]
+            )
+            return best["subnet"]
+
+    except Exception as err:
+        logger.warning("Subnet detection error: %s", err)
+
+    # Hard fallback — most common home/office subnet
+    logger.warning("Could not detect subnet — falling back to 192.168.1.0/24")
     return "192.168.1.0/24"
 
 
 # =============================================================================
-# SECTION 2 — RISK CALCULATOR
+# SECTION 2 — ARP TABLE READER (Windows bonus method)
+# =============================================================================
+
+def get_arp_table():
+    """
+    Read the Windows ARP cache using 'arp -a'.
+
+    The ARP cache is a table the OS maintains mapping IP → MAC for every
+    device it has recently communicated with. Reading it is:
+      • Instant (no network traffic at all)
+      • No privileges required
+      • Gives us MACs we might miss from nmap
+
+    We use this as a SUPPLEMENT to nmap, not a replacement:
+      • ARP cache may be stale (entries expire after ~2 minutes of inactivity)
+      • nmap actively probes — ARP cache is passive
+
+    Returns: dict of {ip: mac} for all non-multicast entries.
+    """
+    devices = {}
+    try:
+        # Run 'arp -a' — available on Windows, Linux, macOS
+        result = subprocess.run(
+            ["arp", "-a"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        for line in result.stdout.splitlines():
+            # Windows 'arp -a' output format:
+            #   10.172.19.1          00-50-56-c0-00-08     dynamic
+            #   10.172.19.74         <own machine>
+            # We extract IP and MAC using regex
+            match = re.search(
+                r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([\da-fA-F]{2}[:-]){5}[\da-fA-F]{2}",
+                line
+            )
+            if match:
+                ip  = match.group(0).split()[0]
+                mac = match.group(0).split()[1].replace("-", ":").upper()
+
+                # Skip multicast/broadcast MACs (not real devices)
+                # Multicast MACs start with 01:00:5E or 33:33 (IPv6 multicast)
+                if mac.startswith("01:") or mac.startswith("33:33") or mac == "FF:FF:FF:FF:FF:FF":
+                    continue
+
+                devices[ip] = mac
+
+        if devices:
+            logger.info("ARP table: found %d entries", len(devices))
+
+    except Exception as err:
+        logger.debug("ARP table read failed: %s", err)
+
+    return devices
+
+
+# =============================================================================
+# SECTION 3 — RISK CALCULATOR
 # =============================================================================
 
 def calculate_risk(open_ports_str, vendor, hostname):
     """
-    Assigns a risk level ('low', 'medium', 'high') based on open ports
-    and device identity.
+    Heuristic risk score based on open ports and device identity.
+    Returns 'low', 'medium', or 'high'.
 
-    INTERVIEW: Is this a real vulnerability scanner?
-    → No. It's a heuristic (rule-based educated guess). A real scanner
-      would check CVE databases (Common Vulnerabilities and Exposures),
-      service versions, SSL certificate expiry, etc.
-      Tools like OpenVAS or Nessus do this properly.
-      Our risk score is a first approximation to show the concept.
+    This is NOT a CVE scanner — it's a simple triage tool.
     """
+    ports = []
     if open_ports_str and open_ports_str.strip():
         ports = [int(p.strip()) for p in open_ports_str.split(",") if p.strip().isdigit()]
-    else:
-        ports = []
 
-    HIGH_RISK_PORTS = {21, 23, 3389, 5900, 4444, 6667}
-    # 21=FTP (unencrypted), 23=Telnet (unencrypted shell),
-    # 3389=RDP (frequent attack target), 5900=VNC,
-    # 4444=Metasploit default, 6667=IRC (botnet C2)
+    HIGH_RISK_PORTS   = {21, 23, 3389, 5900, 4444, 6667}
+    MEDIUM_RISK_PORTS = {22, 80, 443, 8080, 8443, 3306, 5432, 27017}
+
     if any(p in HIGH_RISK_PORTS for p in ports):
         return "high"
-
-    MEDIUM_RISK_PORTS = {22, 80, 443, 8080, 8443, 3306, 5432, 27017}
-    # SSH/web are normal; DB ports exposed externally are concerning
     if any(p in MEDIUM_RISK_PORTS for p in ports):
         return "medium"
     if len(ports) > 5:
-        return "medium"   # Many open ports = larger attack surface
-    if vendor.lower() in ("unknown", "", "n/a"):
-        return "medium"   # Unknown vendor could be rogue device
-
+        return "medium"
+    if not vendor or vendor.lower() in ("unknown", "", "n/a"):
+        return "medium"
     return "low"
 
 
 # =============================================================================
-# SECTION 3 — CORE SCAN
+# SECTION 4 — CORE SCAN FUNCTION
 # =============================================================================
 
 def run_scan(subnet=None):
     """
-    Performs one complete network scan cycle:
-      1. Run nmap ping scan
-      2. Parse results → device dicts
-      3. Upsert each device to DB (with risk_level)
-      4. Mark missing devices offline
-      5. Create alerts for new/blocked/offline devices
-      6. Save scan summary to scan_history
-      7. Update in-memory cache
-    Returns list of device dicts (empty list on error).
+    Full network scan combining nmap + ARP table.
+
+    Flow:
+      1.  Detect subnet (skip APIPA, prefer private ranges)
+      2.  Read ARP cache (instant, no network traffic)
+      3.  Run nmap with ARP+TCP ping arguments
+      4.  If nmap finds nothing, try fallback arguments
+      5.  Merge nmap results with ARP cache
+      6.  Upsert every device to DB
+      7.  Mark absent devices offline
+      8.  Create alerts (new device, blocked, offline)
+      9.  Save scan summary to scan_history
+      10. Update in-memory cache
     """
 
     with cache_lock:
@@ -173,50 +293,88 @@ def run_scan(subnet=None):
     if subnet is None:
         subnet = detect_subnet()
 
-    logger.info("Starting scan of %s", subnet)
+    logger.info("Starting scan — subnet: %s", subnet)
 
     try:
-        # ── Step 1: nmap ─────────────────────────────────────────────────
-        # python-nmap is a wrapper around the nmap CLI binary.
-        # It invokes nmap as a subprocess, captures XML output, and parses it.
-        # INTERVIEW: Why use nmap instead of raw sockets?
-        # → nmap has years of refinement for host discovery, fingerprinting,
-        #   and handling edge cases (firewalls, rate limiting, etc.).
-        #   Reimplementing that in Python would be weeks of work.
-        nm = nmap.PortScanner()
-        nm.scan(hosts=subnet, arguments=NMAP_ARGUMENTS)
+        # ── Step 2: Read ARP cache (free extra data) ──
+        arp_table = get_arp_table()
 
-        # ── Step 2: Parse results ─────────────────────────────────────────
+        # ── Step 3: Run nmap primary scan ──
+        nm = nmap.PortScanner()
+        logger.info("Running nmap: %s %s", NMAP_ARGS_PRIMARY, subnet)
+        nm.scan(hosts=subnet, arguments=NMAP_ARGS_PRIMARY, timeout=SCAN_TIMEOUT)
+
+        found_hosts = [ip for ip in nm.all_hosts() if nm[ip].state() == "up"]
+        logger.info("nmap primary found %d host(s)", len(found_hosts))
+
+        # ── Step 4: Fallback if nmap found nothing ──
+        # This handles VPNs, restrictive firewalls, or environments where
+        # ARP doesn't work (e.g. scanning across a router)
+        if len(found_hosts) == 0 and len(arp_table) == 0:
+            logger.warning("Primary scan found nothing — trying fallback arguments")
+            nm2 = nmap.PortScanner()
+            nm2.scan(hosts=subnet, arguments=NMAP_ARGS_FALLBACK, timeout=SCAN_TIMEOUT)
+            found_hosts = [ip for ip in nm2.all_hosts() if nm2[ip].state() == "up"]
+            if found_hosts:
+                nm = nm2   # Use fallback results
+                logger.info("Fallback scan found %d host(s)", len(found_hosts))
+
+        # ── Step 5: Merge nmap + ARP ──
+        # Build a unified set of all IPs we know about
+        all_ips = set(found_hosts)
+
+        # Add IPs from ARP table that nmap may have missed
+        # Filter to only IPs in our target subnet
+        target_network = ipaddress.ip_network(subnet, strict=False)
+        for ip in arp_table:
+            try:
+                if ipaddress.ip_address(ip) in target_network:
+                    all_ips.add(ip)
+            except ValueError:
+                pass
+
+        logger.info("Total unique hosts (nmap + ARP): %d", len(all_ips))
+
+        # ── Step 6: Build device list + upsert to DB ──
         devices_found    = []
         active_macs      = []
         new_device_count = 0
 
-        for ip in nm.all_hosts():
-            host_data = nm[ip]
-            if host_data.state() != "up":
-                continue
+        for ip in sorted(all_ips):  # sorted = deterministic order
+            # Try to get nmap data for this IP
+            host_data  = nm[ip] if ip in nm.all_hosts() else None
 
-            # Extract hostname, MAC, vendor from nmap output
-            hostname = host_data.hostname() or "Unknown"
-            mac      = host_data['addresses'].get('mac', '').upper()
-            vendor   = host_data.get('vendor', {}).get(mac, 'Unknown') if mac else 'Unknown'
+            # Hostname from nmap
+            hostname = "Unknown"
+            if host_data:
+                hn = host_data.hostname()
+                if hn:
+                    hostname = hn
 
-            # If nmap didn't get a MAC (happens when scanning your own host,
-            # or in non-root mode on some systems), synthesise a stable fake one.
-            # INTERVIEW: Why do we need a MAC at all?
-            # → It's our primary key in the devices table. IPs aren't stable.
-            #   The fake MAC won't match real hardware but it's consistent across scans.
+            # MAC: prefer nmap (more reliable), fall back to ARP table
+            mac = ""
+            if host_data:
+                mac = host_data["addresses"].get("mac", "").upper()
+            if not mac and ip in arp_table:
+                mac = arp_table[ip]
+
+            # Vendor from nmap (requires admin for ARP scan to return vendor)
+            vendor = "Unknown"
+            if host_data and mac and mac in host_data.get("vendor", {}):
+                vendor = host_data["vendor"][mac]
+
+            # Synthetic MAC if we still have nothing
+            # Format: IP octets packed into a MAC-like string for uniqueness
             if not mac:
-                # Use IP octets: scanning 192.168.1.5 → "00:00:C0:A8:01:05"
-                octets = ip.split('.')
-                mac = f"00:00:{int(octets[0]):02X}:{int(octets[1]):02X}:{int(octets[2]):02X}:{int(octets[3]):02X}"
+                octets = ip.split(".")
+                mac = f"00:00:{octets[0].zfill(3)[:2]}:{octets[1].zfill(3)[:2]}:{octets[2].zfill(3)[:2]}:{octets[3].zfill(3)[:2]}"
+                logger.debug("Synthetic MAC for %s: %s", ip, mac)
 
-            # Extract open ports (only populated if using -sV or -p, not -sn)
+            # Open ports (only populated if we did a port scan, not just -sn)
             open_ports = ""
-            if "tcp" in host_data:
+            if host_data and "tcp" in host_data:
                 open_ports = ",".join(str(p) for p in host_data["tcp"].keys())
 
-            # ── Step 3: Calculate risk ────────────────────────────────────
             risk = calculate_risk(open_ports, vendor, hostname)
 
             device = {
@@ -231,22 +389,14 @@ def run_scan(subnet=None):
             }
             devices_found.append(device)
 
-            # ── Step 3: Upsert to DB ──────────────────────────────────────
-            # FIX: Pass risk_level to upsert_device (was missing before,
-            # so risk was calculated but never saved).
+            # Upsert to DB (INSERT if new, UPDATE if seen before)
             row_id, is_new = upsert_device(
-                mac        = mac,
-                ip         = ip,
-                hostname   = hostname,
-                vendor     = vendor,
-                open_ports = open_ports,
-                status     = "online",
-                risk_level = risk,    # ← THE FIX
+                mac=mac, ip=ip, hostname=hostname,
+                vendor=vendor, open_ports=open_ports, status="online"
             )
-
             active_macs.append(mac)
 
-            # Alert for new device
+            # Alert: new device discovered
             if is_new:
                 new_device_count += 1
                 create_alert(
@@ -254,66 +404,55 @@ def run_scan(subnet=None):
                     device_mac  = mac,
                     device_ip   = ip,
                     device_name = hostname if hostname != "Unknown" else vendor,
-                    message     = f"New device: {vendor} at {ip} — hostname: {hostname} — risk: {risk}",
+                    message     = f"New device: {vendor} — {ip} ({hostname})",
                     severity    = "warning" if risk in ("medium", "high") else "info"
                 )
                 logger.info("New device: %s | %s | %s | risk=%s", mac, ip, vendor, risk)
 
-                # Extra alert if the NEW device is already high-risk
-                if risk == "high":
-                    create_alert(
-                        alert_type  = "high_risk",
-                        device_mac  = mac,
-                        device_ip   = ip,
-                        device_name = hostname if hostname != "Unknown" else vendor,
-                        message     = f"HIGH RISK new device detected: {vendor} ({ip}) — open ports: {open_ports}",
-                        severity    = "critical"
-                    )
-
-            # Alert if a blocked device is seen on the network
-            db_device = get_device_by_mac(mac)
-            if db_device and db_device.get("is_blocked"):
+            # Alert: blocked device appeared on network
+            db_dev = get_device_by_mac(mac)
+            if db_dev and db_dev.get("is_blocked"):
                 create_alert(
                     alert_type  = "blocked_attempt",
                     device_mac  = mac,
                     device_ip   = ip,
                     device_name = hostname if hostname != "Unknown" else vendor,
-                    message     = f"BLOCKED device active on network: {vendor} ({ip})",
+                    message     = f"BLOCKED device on network: {vendor} ({ip})",
                     severity    = "critical"
                 )
                 logger.warning("Blocked device detected: %s (%s)", mac, ip)
 
-        # ── Step 4: Mark missing devices offline ──────────────────────────
+        # ── Step 7: Mark absent devices offline ──
         mark_devices_offline(active_macs)
 
-        # ── Step 5: Alert for devices that just went offline ──────────────
-        all_db_devices = get_all_devices()
-        for db_dev in all_db_devices:
+        # ── Step 8: Alert for devices that just went offline ──
+        for db_dev in get_all_devices():
             if db_dev["status"] == "offline" and db_dev["mac"] not in active_macs:
-                last_seen_ts = db_dev["last_seen"]
-                if isinstance(last_seen_ts, datetime):
-                    seconds_ago = (datetime.now() - last_seen_ts).total_seconds()
-                    # Only alert once per offline event (within 2 scan intervals)
-                    if seconds_ago < SCAN_INTERVAL * 2:
+                last_seen = db_dev.get("last_seen")
+                if isinstance(last_seen, datetime):
+                    secs_ago = (datetime.now() - last_seen).total_seconds()
+                    # Only alert if it was online within the last 2 scan intervals
+                    # (avoids alerting on devices that have been offline for hours)
+                    if secs_ago < SCAN_INTERVAL * 2:
                         create_alert(
                             alert_type  = "device_offline",
                             device_mac  = db_dev["mac"],
                             device_ip   = db_dev["ip"],
                             device_name = db_dev["hostname"],
-                            message     = f"Device went offline: {db_dev['hostname']} ({db_dev['ip']})",
+                            message     = f"Device offline: {db_dev['hostname']} ({db_dev['ip']})",
                             severity    = "info"
                         )
 
-        # ── Step 6: Save scan summary ─────────────────────────────────────
+        # ── Step 9: Save scan summary ──
         scan_duration = round(time.time() - scan_start, 2)
         save_scan_result(
-            devices_found  = len(devices_found),
-            new_devices    = new_device_count,
-            scan_duration  = scan_duration,
-            subnet         = subnet,
+            devices_found = len(devices_found),
+            new_devices   = new_device_count,
+            scan_duration = scan_duration,
+            subnet        = subnet
         )
 
-        # ── Step 7: Update cache ──────────────────────────────────────────
+        # ── Step 10: Update cache ──
         with cache_lock:
             scan_cache["devices"]      = devices_found
             scan_cache["last_scan"]    = datetime.now()
@@ -322,14 +461,12 @@ def run_scan(subnet=None):
             scan_cache["subnet"]       = subnet
 
         logger.info(
-            "Scan complete — %d found, %d new | %.2fs",
-            len(devices_found), new_device_count, scan_duration
+            "Scan complete — %d device(s), %d new | %.2fs | subnet: %s",
+            len(devices_found), new_device_count, scan_duration, subnet
         )
         return devices_found
 
     except Exception as err:
-        # Broad catch so the background thread never silently dies.
-        # exc_info=True logs the full traceback — essential for debugging.
         logger.error("Scan failed: %s", err, exc_info=True)
         with cache_lock:
             scan_cache["scan_running"] = False
@@ -338,11 +475,10 @@ def run_scan(subnet=None):
 
 
 # =============================================================================
-# SECTION 4 — BACKGROUND THREAD
+# SECTION 5 — BACKGROUND THREAD
 # =============================================================================
 
-def _background_scan_loop():
-    """Runs forever in a daemon thread: scan → sleep → repeat."""
+def _background_loop():
     logger.info("Background scanner started (interval=%ds)", SCAN_INTERVAL)
     while True:
         run_scan()
@@ -350,29 +486,27 @@ def _background_scan_loop():
 
 
 def start_background_scanner():
-    """Spawns the background scan thread. Called once from app.py startup."""
-    thread = threading.Thread(
-        target = _background_scan_loop,
-        name   = "LanSentry-Scanner",
-        daemon = True,   # ← Dies automatically when Flask process exits
-    )
-    thread.start()
-    logger.info("Scanner thread started (TID=%d)", thread.ident)
-    return thread
+    """
+    Spawns the background scan thread as a daemon.
+    daemon=True: thread dies automatically when Flask exits.
+    This prevents the scanner from keeping the process alive after Ctrl+C.
+    """
+    t = threading.Thread(target=_background_loop, name="LanSentry-Scanner", daemon=True)
+    t.start()
+    logger.info("Background scanner thread started (TID=%d)", t.ident)
+    return t
 
 
 # =============================================================================
-# SECTION 5 — CACHE ACCESSORS
+# SECTION 6 — CACHE ACCESSORS
 # =============================================================================
 
 def get_cached_devices():
-    """Thread-safe read of the latest device list from cache."""
     with cache_lock:
         return list(scan_cache["devices"])
 
 
 def get_scan_status():
-    """Returns a dict snapshot of the scanner state for /api/scan-status."""
     with cache_lock:
         return {
             "scan_running":  scan_cache["scan_running"],
@@ -387,25 +521,17 @@ def get_scan_status():
 
 def trigger_manual_scan(subnet=None):
     """
-    Starts an immediate scan in a new thread.
-    Returns False if a scan is already running.
-    INTERVIEW: Why a new thread and not just run_scan() directly?
-    → The HTTP request handler for POST /api/scan/trigger needs to return
-      a response quickly. If we called run_scan() directly, the request would
-      hang for 5–30 seconds while nmap runs. The new thread lets the response
-      return immediately while the scan continues in the background.
+    Start an immediate on-demand scan in a new thread.
+    Returns False if a scan is already running (prevents pile-up).
     """
     with cache_lock:
         if scan_cache["scan_running"]:
-            logger.warning("Manual scan requested but already running — skipped")
             return False
 
-    thread = threading.Thread(
-        target = run_scan,
-        args   = (subnet,),
-        name   = "LanSentry-ManualScan",
-        daemon = True,
+    t = threading.Thread(
+        target=run_scan, args=(subnet,),
+        name="LanSentry-ManualScan", daemon=True
     )
-    thread.start()
+    t.start()
     logger.info("Manual scan triggered")
     return True

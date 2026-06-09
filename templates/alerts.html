@@ -1,317 +1,364 @@
-{% extends "base.html" %}
-
-{% block title %}Alerts — LanSentry{% endblock %}
-
-{% block content %}
+<!DOCTYPE html>
 <!--
   alerts.html — LanSentry Alert Log
-  ===================================
-  Shows all security events from the MySQL 'alerts' table.
+  ════════════════════════════════════════════════════════════════
+  No Jinja2. Alert rows are built by JavaScript after the page loads,
+  using data from GET /api/alerts.
 
-  DATA FLOW:
-  1. Flask renders the HTML shell (no alert data passed from server)
-  2. loadAlerts() fetches GET /api/alerts on page load
-  3. Renders each alert using renderAlerts()
-  4. Polls every 30 seconds to pick up new events
-  5. Dismiss / Clear All mark alerts as read via POST endpoints
-
-  WHY IS DATA LOADED VIA JS AND NOT JINJA2?
-  → We want the page to update live without full reload.
-    Also, the old Jinja2 approach used wrong field names (alert.ip instead
-    of alert.device_ip) which caused template errors. The JS approach is
-    cleaner and consistent with the rest of the app.
-
-  SCHEMA REMINDER — each alert object from the API has:
-    id, alert_time, alert_type, device_mac, device_ip, device_name,
-    message, severity ('info'|'warning'|'critical'), is_read
+  Features:
+    • Severity colour-coding (info / warning / critical)
+    • Dismiss single alert   → POST /api/alerts/<id>/read
+    • Dismiss all alerts     → POST /api/alerts/read-all
+    • Auto-refresh every 30 seconds
+    • Unread / All toggle filter
+  ════════════════════════════════════════════════════════════════
 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Alerts — LanSentry</title>
+  <link rel="stylesheet" href="/static/style.css" />
 
-<div class="page-header">
-  <div>
-    <div class="breadcrumb">LanSentry / <span>Alerts</span></div>
-    <h2>Alert Log</h2>
-    <p>Security events detected on your network</p>
-  </div>
-  <div class="header-actions">
-    <!-- Severity filter chips -->
-    <div class="filter-chips">
-      <button class="chip chip-active" data-sev="all"      onclick="setSeverityFilter('all')">All</button>
-      <button class="chip chip-danger" data-sev="critical" onclick="setSeverityFilter('critical')">🔴 Critical</button>
-      <button class="chip chip-warn"   data-sev="warning"  onclick="setSeverityFilter('warning')">🟡 Warning</button>
-      <button class="chip"             data-sev="info"     onclick="setSeverityFilter('info')">🔵 Info</button>
-    </div>
-  </div>
-</div>
+  <style>
+    /* ── Severity colour helpers ── */
+    .sev-info     { border-left: 3px solid var(--accent);   }
+    .sev-warning  { border-left: 3px solid var(--warning);  }
+    .sev-critical { border-left: 3px solid var(--danger);   }
 
-<!-- Main panel -->
-<div class="panel">
+    .sev-icon-info     { background: rgba(0,212,255,0.1);  }
+    .sev-icon-warning  { background: var(--warning-bg);    }
+    .sev-icon-critical { background: var(--danger-bg);     }
 
-  <div class="panel-header">
-    <div class="panel-title">
-      <div class="dot" style="background:var(--danger); box-shadow:0 0 8px var(--danger);"></div>
-      Security Events
-      <span class="count-badge" id="alert-total-badge">–</span>
-    </div>
-    <div class="panel-actions">
-      <!--
-        "Mark All Read" — calls POST /api/alerts/read-all.
-        This persists to the DB so the badge count drops on every page.
-        The old clearAlerts() only cleared the DOM — reloading the page
-        showed everything again. This fix ensures it's persistent.
-      -->
-      <button class="btn btn-ghost" id="mark-all-btn" onclick="markAllRead()">
-        ✔ Mark All Read
+    /* Dismiss button — small, sits to the right of each alert */
+    .btn-dismiss {
+      flex-shrink:   0;
+      padding:       5px 10px;
+      font-size:     11px;
+      background:    var(--bg-secondary);
+      color:         var(--text-muted);
+      border:        1px solid var(--border);
+      border-radius: 6px;
+      cursor:        pointer;
+      transition:    var(--transition);
+      font-family:   inherit;
+    }
+    .btn-dismiss:hover {
+      color:         var(--text-primary);
+      border-color:  var(--text-muted);
+    }
+
+    /* Filter toggle pills */
+    .filter-pills {
+      display:    flex;
+      gap:        8px;
+      flex-wrap:  wrap;
+    }
+    .pill {
+      padding:       5px 14px;
+      border-radius: 20px;
+      font-size:     12px;
+      font-weight:   700;
+      cursor:        pointer;
+      border:        1px solid var(--border);
+      background:    var(--bg-secondary);
+      color:         var(--text-secondary);
+      transition:    var(--transition);
+    }
+    .pill.active {
+      background:   rgba(0,212,255,0.12);
+      color:        var(--accent);
+      border-color: rgba(0,212,255,0.3);
+    }
+    .alert-meta {
+      font-size:   11px;
+      color:       var(--text-muted);
+      font-family: 'Space Mono', monospace;
+      margin-top:  4px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── NAVBAR ── -->
+  <nav class="navbar">
+    <a class="navbar-brand" href="/">
+      <div class="logo-icon">🛡️</div>
+      <h1>Lan<span>Sentry</span></h1>
+    </a>
+    <ul class="nav-links">
+      <li><a href="/"        id="nav-home">🏠 Home</a></li>
+      <li><a href="/devices" id="nav-devices">📡 Devices</a></li>
+      <li><a href="/alerts"  id="nav-alerts">
+        🚨 Alerts
+        <span class="alert-badge" id="alert-badge" style="display:none">0</span>
+      </a></li>
+    </ul>
+    <div class="nav-right">
+      <div class="network-status">
+        <div class="status-dot"></div>
+        <span>Network Active</span>
+      </div>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">
+        <div class="toggle-knob" id="toggle-knob">🌙</div>
+      </button>
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span><span></span><span></span>
       </button>
     </div>
+  </nav>
+  <div class="mobile-nav" id="mobile-nav">
+    <a href="/">🏠 Home</a>
+    <a href="/devices">📡 Devices</a>
+    <a href="/alerts">🚨 Alerts</a>
   </div>
 
-  <!-- Alert list — populated by renderAlerts() -->
-  <div id="alerts-container" role="log" aria-live="polite" aria-label="Alert log">
-    <div class="empty-state">
-      <div class="empty-icon">⏳</div>
-      <p>Loading alerts…</p>
+  <!-- ── MAIN CONTENT ── -->
+  <div class="container">
+
+    <div class="page-header">
+      <div class="breadcrumb">LanSentry / <span>Alerts</span></div>
+      <h2>Alert Log</h2>
+      <p>Security events and network activity detected by the scanner</p>
     </div>
-  </div>
 
-  <div class="panel-footer">
-    <div class="update-info">
-      <div class="live-dot"></div>
-      <span id="alerts-updated">Monitoring active</span>
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <div class="dot" style="background:var(--danger);box-shadow:0 0 8px var(--danger);"></div>
+          Security Alerts
+        </div>
+        <div class="panel-actions">
+          <!-- Filter pills -->
+          <div class="filter-pills">
+            <button class="pill active" id="pill-all"    onclick="setFilter('all')">All</button>
+            <button class="pill"        id="pill-unread" onclick="setFilter('unread')">Unread</button>
+          </div>
+          <button class="btn btn-ghost" onclick="dismissAll()">🗑️ Dismiss All</button>
+        </div>
+      </div>
+
+      <!-- Alert rows injected here by renderAlerts() -->
+      <div id="alerts-container">
+        <div class="no-alerts">
+          <div class="shield">⏳</div>
+          <h3>Loading…</h3>
+          <p>Fetching alert data from the server.</p>
+        </div>
+      </div>
+
+      <div class="panel-footer">
+        <div class="update-info">
+          <div class="live-dot"></div>
+          <span id="alerts-updated">Monitoring active</span>
+        </div>
+        <span class="next-scan">Auto-refreshes every 30s</span>
+      </div>
     </div>
-    <span class="next-scan">Auto-refreshes every 30s</span>
-  </div>
 
-</div>
-{% endblock %}
+  </div><!-- /container -->
 
+  <div class="toast-container" id="toast-container"></div>
 
-{% block scripts %}
-<script>
-// ═══════════════════════════════════════════════════════════════════════
-// alerts.js — Alert log logic
-// ═══════════════════════════════════════════════════════════════════════
+  <!-- ── JAVASCRIPT ── -->
+  <script>
+  // ── Global utilities ──────────────────────────────────────────────────────
 
-let allAlerts     = [];
-let severityFilter = 'all';
+  (function() {
+    if (localStorage.getItem("lansentry-theme") === "light")
+      document.body.classList.add("light-mode");
+  })();
 
-
-// ── SEVERITY FILTER ──────────────────────────────────────────────────────
-
-function setSeverityFilter(sev) {
-  severityFilter = sev;
-  document.querySelectorAll('[data-sev]').forEach(chip => {
-    chip.classList.toggle('chip-active', chip.dataset.sev === sev);
-  });
-  renderAlerts(getFilteredAlerts());
-}
-
-function getFilteredAlerts() {
-  if (severityFilter === 'all') return allAlerts;
-  return allAlerts.filter(a => a.severity === severityFilter);
-}
-
-
-// ── ICON MAP ─────────────────────────────────────────────────────────────
-
-const ALERT_ICONS = {
-  new_device:      '🆕',
-  device_offline:  '📴',
-  blocked_attempt: '🚫',
-  high_risk:       '⚠️',
-  port_change:     '🔌',
-};
-
-const SEVERITY_LABEL = {
-  critical: ['severity-critical', '🔴 Critical'],
-  warning:  ['severity-warning',  '🟡 Warning'],
-  info:     ['severity-info',     '🔵 Info'],
-};
-
-
-// ── RENDER ALERTS ────────────────────────────────────────────────────────
-
-/**
- * renderAlerts(alerts) — builds the alert list HTML.
- *
- * Each alert row shows:
- *  • Icon (based on alert_type)
- *  • Title + message
- *  • Device IP and MAC
- *  • Severity badge
- *  • Time (relative)
- *  • Dismiss button (marks as read in DB)
- *
- * SECURITY: escapeHTML() on all dynamic data before innerHTML.
- */
-function renderAlerts(alerts) {
-  const container = document.getElementById('alerts-container');
-  document.getElementById('alert-total-badge').textContent = allAlerts.length;
-
-  if (!alerts || alerts.length === 0) {
-    container.innerHTML = `
-      <div class="no-alerts">
-        <div class="shield">🛡️</div>
-        <h3>All Clear!</h3>
-        <p>No alerts match your current filter.<br>Your network looks clean.</p>
-      </div>`;
-    return;
+  function toggleTheme() {
+    document.body.classList.toggle("light-mode");
+    const isLight = document.body.classList.contains("light-mode");
+    document.getElementById("toggle-knob").textContent = isLight ? "☀️" : "🌙";
+    localStorage.setItem("lansentry-theme", isLight ? "light" : "dark");
   }
 
-  container.innerHTML = alerts.map(alert => {
-    const icon     = ALERT_ICONS[alert.alert_type] || '🔔';
-    const [sevCls, sevLabel] = SEVERITY_LABEL[alert.severity] || ['severity-info', '🔵 Info'];
-    const readCls  = alert.is_read ? 'alert-item alert-read' : 'alert-item';
+  function escapeHTML(str) {
+    if (str == null) return "";
+    const el = document.createElement("div");
+    el.textContent = String(str);
+    return el.innerHTML;
+  }
 
-    // Sanitise all user-originated fields
-    const msgHtml    = escapeHTML(alert.message     || '');
-    const nameHtml   = escapeHTML(alert.device_name || 'Unknown');
-    const ipHtml     = escapeHTML(alert.device_ip   || '');
-    const macHtml    = escapeHTML(alert.device_mac  || '');
-    const timeStr    = timeAgo(alert.alert_time);
-    const typeLabel  = escapeHTML((alert.alert_type || '').replace(/_/g, ' '));
+  function showToast(msg, type = "info", duration = 3500) {
+    const icons = { success:"✅", error:"❌", info:"ℹ️", warning:"⚠️" };
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `<span>${icons[type]||"ℹ️"}</span><span>${escapeHTML(msg)}</span>`;
+    document.getElementById("toast-container").appendChild(toast);
+    setTimeout(() => {
+      toast.style.animation = "toastOut 0.3s ease forwards";
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
 
-    return `
-      <div class="${readCls}" id="alert-${alert.id}" data-id="${alert.id}">
-        <div class="alert-icon-wrap ${sevCls}-bg">${icon}</div>
-        <div class="alert-content">
-          <div class="alert-title">
-            ${nameHtml}
-            <span class="alert-type-label">${typeLabel}</span>
-          </div>
-          <div class="alert-message">${msgHtml}</div>
-          <div class="alert-meta">
-            ${ipHtml  ? `<span class="meta-pill">📍 ${ipHtml}</span>`  : ''}
-            ${macHtml ? `<span class="meta-pill">🔌 ${macHtml}</span>` : ''}
-          </div>
-        </div>
-        <div class="alert-right">
-          <span class="badge ${sevCls}">${sevLabel}</span>
-          <span class="alert-time">${timeStr}</span>
-          ${!alert.is_read ? `
-            <button class="btn btn-ghost btn-xs"
-              onclick="dismissAlert(${alert.id})"
-              aria-label="Dismiss alert">
-              ✔ Dismiss
-            </button>` : ''}
-        </div>
-      </div>`;
-  }).join('');
-}
+  function updateAlertBadge() {
+    fetch("/api/alerts/unread-count")
+      .then(r => r.json())
+      .then(data => {
+        const badge = document.getElementById("alert-badge");
+        if (data.count > 0) {
+          badge.textContent   = data.count;
+          badge.style.display = "inline";
+        } else {
+          badge.style.display = "none";
+        }
+      }).catch(() => {});
+  }
 
+  // ── Page state ────────────────────────────────────────────────────────────
 
-// ── DISMISS SINGLE ALERT ─────────────────────────────────────────────────
+  let currentFilter = "all";   // "all" or "unread"
 
-/**
- * dismissAlert(id) — marks one alert as read via POST /api/alerts/<id>/read
- *
- * WHY POST?
- * → Same reason as block: this changes state. GET requests should be
- *   read-only. A POST with a specific resource ID is also idempotent —
- *   marking an already-read alert as read does nothing harmful.
- */
-async function dismissAlert(alertId) {
-  try {
-    const res  = await fetch(`/api/alerts/${alertId}/read`, { method: 'POST' });
-    const data = await res.json();
+  function setFilter(f) {
+    currentFilter = f;
+    document.getElementById("pill-all").classList.toggle("active",    f === "all");
+    document.getElementById("pill-unread").classList.toggle("active", f === "unread");
+    loadAlerts();
+  }
 
-    if (data.success) {
-      // Visually mark the row as read without re-fetching everything
-      const row = document.getElementById(`alert-${alertId}`);
-      if (row) {
-        row.classList.add('alert-read');
-        row.querySelector('.btn-xs')?.remove();   // Remove dismiss button
+  // ── Severity helpers ──────────────────────────────────────────────────────
+
+  const SEV_ICON = {
+    info:     "ℹ️",
+    warning:  "⚠️",
+    critical: "🚨",
+  };
+
+  const TYPE_LABEL = {
+    new_device:      "New Device",
+    device_offline:  "Device Offline",
+    blocked_attempt: "Blocked Attempt",
+    high_risk:       "High Risk",
+    port_change:     "Port Change",
+  };
+
+  // ── Render alerts ─────────────────────────────────────────────────────────
+
+  function renderAlerts(alerts) {
+    const container = document.getElementById("alerts-container");
+
+    if (alerts.length === 0) {
+      container.innerHTML = `
+        <div class="no-alerts">
+          <div class="shield">🛡️</div>
+          <h3>All Clear!</h3>
+          <p>No alerts to show for the current filter.<br>Your network looks clean.</p>
+        </div>`;
+      return;
+    }
+
+    container.innerHTML = alerts.map(a => {
+      // Format the timestamp into a human-readable relative time
+      let timeLabel = "";
+      if (a.alert_time) {
+        const diff = Math.round((Date.now() - new Date(a.alert_time)) / 1000);
+        timeLabel = diff < 60   ? `${diff}s ago`
+                  : diff < 3600 ? `${Math.round(diff/60)}m ago`
+                  : diff < 86400? `${Math.round(diff/3600)}h ago`
+                  : new Date(a.alert_time).toLocaleDateString();
       }
 
-      // Update the local array so filter re-renders are consistent
-      const idx = allAlerts.findIndex(a => a.id === alertId);
-      if (idx !== -1) allAlerts[idx].is_read = 1;
+      const sev      = a.severity || "info";
+      const icon     = SEV_ICON[sev]  || "ℹ️";
+      const typeLabel = TYPE_LABEL[a.alert_type] || escapeHTML(a.alert_type);
 
-      showToast('Alert dismissed', 'success', 1500);
+      // is_read=0 means unread — bold styling via font-weight
+      const unreadStyle = a.is_read ? "" : "font-weight:700;";
+
+      return `
+        <div class="alert-item sev-${escapeHTML(sev)}" id="alert-row-${a.id}">
+          <div class="alert-icon-wrap sev-icon-${escapeHTML(sev)}">${icon}</div>
+          <div class="alert-content" style="flex:1; ${unreadStyle}">
+            <div class="alert-title">${escapeHTML(typeLabel)}</div>
+            <div class="alert-detail">${escapeHTML(a.message)}</div>
+            <div class="alert-meta">
+              ${escapeHTML(a.device_ip || "")}
+              ${a.device_ip && a.device_name ? " · " : ""}
+              ${escapeHTML(a.device_name || "")}
+              ${timeLabel ? " · " + escapeHTML(timeLabel) : ""}
+            </div>
+          </div>
+          <button class="btn-dismiss"
+                  data-id="${a.id}"
+                  onclick="dismissOne(this)"
+                  ${a.is_read ? 'style="opacity:0.4"' : ""}>
+            ${a.is_read ? "✓" : "Dismiss"}
+          </button>
+        </div>`;
+    }).join("");
+  }
+
+  // ── API calls ─────────────────────────────────────────────────────────────
+
+  async function loadAlerts() {
+    try {
+      const unreadOnly = currentFilter === "unread" ? "true" : "false";
+      const data = await fetch(`/api/alerts?limit=200&unread_only=${unreadOnly}`)
+                          .then(r => r.json());
+
+      renderAlerts(data.alerts || []);
+
+      document.getElementById("alerts-updated").textContent =
+        `Last checked: ${new Date().toLocaleTimeString()} · ${data.count} alert(s)`;
+
+      // Refresh badge since we may have changed read state
+      updateAlertBadge();
+    } catch(e) {
+      showToast("Failed to load alerts.", "error");
     }
-  } catch {
-    showToast('Failed to dismiss alert', 'error');
   }
-}
 
-
-// ── MARK ALL READ ────────────────────────────────────────────────────────
-
-/**
- * markAllRead() — calls POST /api/alerts/read-all.
- * Persists to DB so the navbar badge count drops to 0.
- * The old DOM-only clearAlerts() was misleading — data came back on reload.
- */
-async function markAllRead() {
-  const btn = document.getElementById('mark-all-btn');
-  btn.disabled  = true;
-  btn.textContent = '⏳ Clearing…';
-
-  try {
-    const res  = await fetch('/api/alerts/read-all', { method: 'POST' });
-    const data = await res.json();
-
-    if (data.success) {
-      showToast(`${data.cleared} alert(s) marked as read`, 'success');
-      allAlerts.forEach(a => a.is_read = 1);   // Update local state
-      renderAlerts(getFilteredAlerts());
-    } else {
-      showToast('Failed to clear alerts', 'error');
+  async function dismissOne(btn) {
+    const id = btn.dataset.id;
+    try {
+      await fetch(`/api/alerts/${id}/read`, { method: "POST" });
+      // Fade out and remove the row
+      const row = document.getElementById(`alert-row-${id}`);
+      if (row) {
+        row.style.transition = "opacity 0.3s";
+        row.style.opacity    = "0";
+        setTimeout(() => row.remove(), 300);
+      }
+      updateAlertBadge();
+    } catch(e) {
+      showToast("Could not dismiss alert.", "error");
     }
-  } catch {
-    showToast('Network error', 'error');
-  } finally {
-    btn.disabled    = false;
-    btn.textContent = '✔ Mark All Read';
   }
-}
 
-
-// ── FETCH ALERTS ─────────────────────────────────────────────────────────
-
-/**
- * loadAlerts() — GET /api/alerts?limit=200
- * Fetches and renders the alert list.
- */
-async function loadAlerts() {
-  try {
-    const res  = await fetch('/api/alerts?limit=200');
-    const data = await res.json();
-
-    if (!data.success) throw new Error(data.message);
-
-    allAlerts = data.alerts;
-
-    renderAlerts(getFilteredAlerts());
-
-    const now = new Date();
-    document.getElementById('alerts-updated').textContent =
-      'Last checked: ' + now.toLocaleTimeString();
-
-  } catch (err) {
-    document.getElementById('alerts-container').innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">❌</div>
-        <p>Failed to load alerts. Is the server running?</p>
-      </div>`;
-    console.error('loadAlerts error:', err);
+  async function dismissAll() {
+    if (!confirm("Mark all alerts as read?")) return;
+    try {
+      const data = await fetch("/api/alerts/read-all", { method:"POST" }).then(r=>r.json());
+      showToast(`Dismissed ${data.cleared} alert(s)`, "success");
+      loadAlerts();
+    } catch(e) {
+      showToast("Failed to dismiss alerts.", "error");
+    }
   }
-}
 
-// ── timeAgo helper (same as devices.html — ideally this would be in a shared JS file)
-function timeAgo(isoStr) {
-  if (!isoStr) return '—';
-  const diff = Math.floor((Date.now() - new Date(isoStr)) / 1000);
-  if (diff < 5)    return 'just now';
-  if (diff < 60)   return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400)return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
+  // ── Init ──────────────────────────────────────────────────────────────────
 
+  document.addEventListener("DOMContentLoaded", () => {
+    if (document.body.classList.contains("light-mode"))
+      document.getElementById("toggle-knob").textContent = "☀️";
 
-// ── INIT ─────────────────────────────────────────────────────────────────
+    document.getElementById("nav-alerts").classList.add("active");
 
-loadAlerts();
-setInterval(loadAlerts, 30000);   // Auto-refresh every 30 seconds
-</script>
-{% endblock %}
+    document.getElementById("hamburger").addEventListener("click", () =>
+      document.getElementById("mobile-nav").classList.toggle("open")
+    );
+
+    updateAlertBadge();
+    setInterval(updateAlertBadge, 30_000);
+
+    loadAlerts();
+    setInterval(loadAlerts, 30_000);
+  });
+  </script>
+
+</body>
+</html>
