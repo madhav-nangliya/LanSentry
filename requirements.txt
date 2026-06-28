@@ -1,0 +1,4 @@
+flask>=3.0.0
+mysql-connector-python>=8.3.0
+python-nmap>=0.7.1
+psutil>=5.9.0

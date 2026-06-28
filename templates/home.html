@@ -9,12 +9,12 @@
   Data flow:
     Browser loads home.html (static file, instant)
        ↓  JS runs
-    fetch("/api/scan-status")        → updates "Last scan" + button state
-    fetch("/api/chart/device-status")→ fills stat cards + doughnut chart
-    fetch("/api/chart/scan-history") → draws line chart
+    fetch("/api/scan-status")         → updates "Last scan" + button state
+    fetch("/api/chart/device-status") → fills stat cards + doughnut chart
+    fetch("/api/chart/scan-history")  → draws line chart
     fetch("/api/chart/risk-breakdown")→ draws risk doughnut
-    fetch("/api/chart/alerts")       → draws bar chart
-    fetch("/api/alerts/unread-count")→ updates nav badge (in base JS)
+    fetch("/api/chart/alerts")        → draws bar chart
+    fetch("/api/alerts/unread-count") → updates nav badge (in base JS)
   ════════════════════════════════════════════════════════════════
 -->
 <html lang="en">
@@ -72,11 +72,11 @@
     /* Stat cards grid */
     .stats-grid {
       display:               grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap:                   16px;
       margin-bottom:         28px;
     }
-    @media (max-width: 900px)  { .stats-grid { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 900px)  { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
     @media (max-width: 560px)  { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 
     .stat-card {
@@ -107,7 +107,6 @@
     .stat-icon--blue   { background: rgba(0,212,255,0.1); }
     .stat-icon--green  { background: rgba(0,255,148,0.1); }
     .stat-icon--grey   { background: rgba(113,128,150,0.1); }
-    .stat-icon--red    { background: rgba(255,71,87,0.1); }
     .stat-icon--orange { background: rgba(255,107,53,0.1); }
 
     .stat-value {
@@ -117,7 +116,6 @@
       line-height:  1;
     }
     .stat-value--green  { color: var(--success); }
-    .stat-value--red    { color: var(--danger); }
     .stat-value--orange { color: var(--warning); }
 
     .stat-label {
@@ -137,7 +135,7 @@
       gap:             12px;
       margin-bottom:   28px;
     }
-    .page-title   { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
+    .page-title    { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
     .page-subtitle { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
 
     /* Pulse ring on the Scan Now button */
@@ -164,6 +162,7 @@
         🚨 Alerts
         <span class="alert-badge" id="alert-badge" style="display:none">0</span>
       </a></li>
+      <li><a href="/history" id="nav-history">📋 History</a></li>
     </ul>
     <div class="nav-right">
       <div class="network-status">
@@ -182,6 +181,7 @@
     <a href="/">🏠 Home</a>
     <a href="/devices">📡 Devices</a>
     <a href="/alerts">🚨 Alerts</a>
+    <a href="/history">📋 History</a>
   </div>
 
   <!-- ── MAIN CONTENT ── -->
@@ -221,13 +221,6 @@
         <div>
           <div class="stat-value" id="stat-offline">—</div>
           <div class="stat-label">Offline</div>
-        </div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon stat-icon--red">🚫</div>
-        <div>
-          <div class="stat-value stat-value--red" id="stat-blocked">—</div>
-          <div class="stat-label">Blocked</div>
         </div>
       </div>
       <div class="stat-card">
@@ -409,16 +402,14 @@
   // CHART COLOUR PALETTE
   // ==========================================================================
   // Centralised here so changing one variable updates every chart.
-  // isDarkMode() reads the body class so it always reflects the current theme.
   const isDark = () => document.body.classList.contains("light-mode") === false;
 
   const C = {
     online:  "#48BB78",
     offline: "#718096",
-    blocked: "#FC8181",
+    high:    "#FC8181",
     low:     "#48BB78",
     medium:  "#F6AD55",
-    high:    "#FC8181",
     blue:    "#63B3ED",
     grid:    () => isDark() ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)",
     text:    () => isDark() ? "#CBD5E0" : "#4A5568",
@@ -492,10 +483,11 @@
       hide("status-loading"); show("statusChart");
       if (chartStatus) chartStatus.destroy();
 
-      // Also update stat cards while we have the data
+      // Update stat cards while we have the data
+      // API returns: [online, offline, high_risk]
       document.getElementById("stat-online").textContent  = data.data[0];
       document.getElementById("stat-offline").textContent = data.data[1];
-      document.getElementById("stat-blocked").textContent = data.data[2];
+      document.getElementById("stat-risk").textContent    = data.data[2];
       document.getElementById("stat-total").textContent   = data.total;
 
       chartStatus = new Chart(getCtx("statusChart"), {
@@ -503,7 +495,7 @@
         data: {
           labels: data.labels,
           datasets: [{ data: data.data,
-            backgroundColor: [C.online, C.offline, C.blocked],
+            backgroundColor: [C.online, C.offline, C.high],
             borderWidth: 2, borderColor: C.border(), hoverOffset: 8
           }]
         },
@@ -521,9 +513,6 @@
       const data = await fetchJSON("/api/chart/risk-breakdown");
       hide("risk-loading"); show("riskChart");
       if (chartRisk) chartRisk.destroy();
-
-      // Update high-risk stat card
-      document.getElementById("stat-risk").textContent = data.data[2];
 
       chartRisk = new Chart(getCtx("riskChart"), {
         type: "doughnut",
@@ -561,10 +550,9 @@
         data: {
           labels: data.labels,
           datasets: [
-            { label:"New Device",      data:data.new_device,      backgroundColor:C.blue,    borderRadius:4, borderSkipped:false },
-            { label:"Blocked Attempt", data:data.blocked_attempt, backgroundColor:C.blocked, borderRadius:4, borderSkipped:false },
-            { label:"Device Offline",  data:data.device_offline,  backgroundColor:C.offline, borderRadius:4, borderSkipped:false },
-            { label:"High Risk",       data:data.high_risk,        backgroundColor:C.medium,  borderRadius:4, borderSkipped:false },
+            { label:"New Device",     data:data.new_device,     backgroundColor:C.blue,   borderRadius:4, borderSkipped:false },
+            { label:"Device Offline", data:data.device_offline, backgroundColor:C.offline, borderRadius:4, borderSkipped:false },
+            { label:"High Risk",      data:data.high_risk,       backgroundColor:C.high,   borderRadius:4, borderSkipped:false },
           ]
         },
         options: chartOptions({
@@ -606,7 +594,7 @@
       const data = await fetchJSON("/api/chart/device-status");
       document.getElementById("stat-online").textContent  = data.data[0];
       document.getElementById("stat-offline").textContent = data.data[1];
-      document.getElementById("stat-blocked").textContent = data.data[2];
+      document.getElementById("stat-risk").textContent    = data.data[2];
       document.getElementById("stat-total").textContent   = data.total;
     } catch(e) {}
   }

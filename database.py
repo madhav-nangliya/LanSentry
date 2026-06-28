@@ -115,8 +115,7 @@ def _create_tables():
                 vendor       VARCHAR(255) DEFAULT 'Unknown',
                 os_guess     VARCHAR(255) DEFAULT 'Unknown',
                 open_ports   TEXT         NULL,
-                status       ENUM('online','offline','blocked') DEFAULT 'online',
-                is_blocked   TINYINT(1)   DEFAULT 0,
+                status       ENUM('online','offline') DEFAULT 'online',
                 risk_level   ENUM('low','medium','high') DEFAULT 'low',
                 first_seen   DATETIME     DEFAULT CURRENT_TIMESTAMP,
                 last_seen    DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -241,7 +240,7 @@ def get_all_devices():
     try:
         cursor.execute("""
             SELECT id, mac, ip, hostname, vendor, os_guess,
-                   open_ports, status, is_blocked, risk_level,
+                   open_ports, status, risk_level,
                    first_seen, last_seen
             FROM devices
             ORDER BY last_seen DESC
@@ -270,35 +269,6 @@ def get_device_by_mac(mac):
         conn.close()
 
 
-def set_device_blocked(mac, blocked: bool):
-    """
-    Toggle is_blocked and status for a device.
-    Returns True if the MAC was found and updated.
-
-    INTERVIEW: Why do we check rowcount?
-    → cursor.rowcount is the number of rows affected by the last UPDATE.
-      If it's 0, the MAC wasn't found in the table. We use this to tell
-      the API caller whether the operation succeeded.
-    """
-    conn   = get_connection()
-    cursor = conn.cursor()
-    status = "blocked" if blocked else "online"
-    flag   = 1         if blocked else 0
-    try:
-        cursor.execute("""
-            UPDATE devices SET is_blocked = %s, status = %s WHERE mac = %s
-        """, (flag, status, mac))
-        conn.commit()
-        return cursor.rowcount > 0
-    except mysql.connector.Error as err:
-        logger.error("set_device_blocked(%s): %s", mac, err)
-        conn.rollback()
-        return False
-    finally:
-        cursor.close()
-        conn.close()
-
-
 def mark_devices_offline(active_macs: list):
     """
     After a scan, mark any device NOT in active_macs as 'offline'.
@@ -320,7 +290,6 @@ def mark_devices_offline(active_macs: list):
             UPDATE devices
             SET status = 'offline'
             WHERE mac NOT IN ({placeholders})
-              AND is_blocked = 0
               AND status = 'online'
         """, tuple(active_macs))
         conn.commit()
@@ -336,8 +305,8 @@ def mark_devices_offline(active_macs: list):
 
 def get_device_stats():
     """
-    Returns {'total', 'online', 'offline', 'blocked', 'high_risk'}.
-    Uses conditional SUM in a single query — faster than 5 COUNT queries.
+    Returns {'total', 'online', 'offline', 'high_risk'}.
+    Uses conditional SUM in a single query — faster than 4 COUNT queries.
 
     INTERVIEW: What does SUM(status = 'online') do?
     → In MySQL, a boolean expression returns 1 (true) or 0 (false).
@@ -352,7 +321,6 @@ def get_device_stats():
                 COUNT(*)                 AS total,
                 SUM(status = 'online')   AS online,
                 SUM(status = 'offline')  AS offline,
-                SUM(status = 'blocked')  AS blocked,
                 SUM(risk_level = 'high') AS high_risk
             FROM devices
         """)
@@ -360,7 +328,7 @@ def get_device_stats():
         return {k: int(v or 0) for k, v in row.items()}
     except mysql.connector.Error as err:
         logger.error("get_device_stats: %s", err)
-        return {"total": 0, "online": 0, "offline": 0, "blocked": 0, "high_risk": 0}
+        return {"total": 0, "online": 0, "offline": 0, "high_risk": 0}
     finally:
         cursor.close()
         conn.close()
@@ -540,7 +508,6 @@ def get_alerts_for_chart(days=7):
             SELECT
                 DATE(alert_time)                            AS day,
                 SUM(alert_type = 'new_device')              AS new_device,
-                SUM(alert_type = 'blocked_attempt')         AS blocked_attempt,
                 SUM(alert_type = 'device_offline')          AS device_offline,
                 SUM(alert_type = 'high_risk')               AS high_risk,
                 COUNT(*)                                    AS total

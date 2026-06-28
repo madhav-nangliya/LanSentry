@@ -5,8 +5,6 @@
   No Jinja2. The device table is built entirely by JavaScript
   after the page loads, using data from GET /api/devices.
 
-  Block / Unblock uses POST /api/devices/<mac>/block with a JSON body.
-
   Security note:
     All device data (hostname, vendor etc.) is passed through escapeHTML()
     before being inserted into innerHTML. This prevents a device on the
@@ -35,6 +33,7 @@
         🚨 Alerts
         <span class="alert-badge" id="alert-badge" style="display:none">0</span>
       </a></li>
+      <li><a href="/history" id="nav-history">📋 History</a></li>
     </ul>
     <div class="nav-right">
       <div class="network-status">
@@ -53,6 +52,7 @@
     <a href="/">🏠 Home</a>
     <a href="/devices">📡 Devices</a>
     <a href="/alerts">🚨 Alerts</a>
+    <a href="/history">📋 History</a>
   </div>
 
   <!-- ── MAIN CONTENT ── -->
@@ -99,12 +99,11 @@
               <th>Vendor</th>
               <th>Risk</th>
               <th>Status</th>
-              <th>Action</th>
             </tr>
           </thead>
           <tbody id="device-tbody">
             <!-- Rows injected by renderTable() -->
-            <tr><td colspan="8">
+            <tr><td colspan="7">
               <div class="empty-state">
                 <div class="empty-icon">📡</div>
                 <p>Loading devices…</p>
@@ -189,7 +188,7 @@
     const tbody = document.getElementById("device-tbody");
 
     if (devices.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="8">
+      tbody.innerHTML = `<tr><td colspan="7">
         <div class="empty-state">
           <div class="empty-icon">📡</div>
           <p>No devices found on the network.</p>
@@ -200,11 +199,9 @@
 
     tbody.innerHTML = devices.map((d, i) => {
       // ── Status badge ──
-      // status comes from the DB: 'online', 'offline', or 'blocked'
+      // status comes from the DB: 'online' or 'offline'
       const statusBadge =
-        d.status === "blocked"
-          ? `<span class="badge badge-warning"><span class="badge-dot"></span>Blocked</span>`
-        : d.status === "online"
+        d.status === "online"
           ? `<span class="badge badge-online"><span class="badge-dot"></span>Online</span>`
           : `<span class="badge badge-offline"><span class="badge-dot"></span>Offline</span>`;
 
@@ -219,29 +216,6 @@
           border: 1px solid ${riskColour}44;">
           ${escapeHTML(d.risk_level || "low")}
         </span>`;
-
-      // ── Action button ──
-      // We use data-mac attribute to pass the MAC to the click handler.
-      // This avoids building onclick strings with user data inside them
-      // (which could be an XSS vector if MAC somehow contained quotes).
-      const isBlocked = d.status === "blocked" || d.is_blocked;
-      const actionBtn = isBlocked
-        ? `<button class="btn btn-outline"
-               style="padding:5px 12px;font-size:12px;"
-               data-mac="${escapeHTML(d.mac)}"
-               data-action="unblock"
-               onclick="handleBlockClick(this)">
-             ✅ Unblock
-           </button>`
-        : `<button class="btn"
-               style="padding:5px 12px;font-size:12px;
-                      background:var(--danger-bg);color:var(--danger);
-                      border:1px solid var(--danger);"
-               data-mac="${escapeHTML(d.mac)}"
-               data-action="block"
-               onclick="handleBlockClick(this)">
-             🚫 Block
-           </button>`;
 
       // ── Format last_seen ──
       let lastSeen = "—";
@@ -260,7 +234,6 @@
         <td style="color:var(--text-secondary);font-size:12px;">${escapeHTML(d.vendor || "Unknown")}</td>
         <td>${riskBadge}</td>
         <td>${statusBadge}</td>
-        <td>${actionBtn}</td>
       </tr>`;
     }).join("");
   }
@@ -285,46 +258,6 @@
     }
   }
 
-  // ── Block / Unblock ───────────────────────────────────────────────────────
-  // Called via onclick="handleBlockClick(this)" on the buttons in renderTable().
-  // 'this' = the button element; we read data-mac and data-action attributes.
-
-  async function handleBlockClick(btn) {
-    const mac    = btn.dataset.mac;
-    const action = btn.dataset.action;  // "block" or "unblock"
-    const label  = action === "block" ? "Block" : "Unblock";
-
-    if (!confirm(`${label} device ${mac}?`)) return;
-
-    // Disable button while request is in flight (prevents double-clicks)
-    btn.disabled    = true;
-    btn.textContent = "⏳…";
-
-    try {
-      const res = await fetch(`/api/devices/${encodeURIComponent(mac)}/block`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        // Send blocked:true to block, false to unblock
-        body: JSON.stringify({ blocked: action === "block" })
-      });
-
-      const data = await res.json();
-
-      if (data.success) {
-        showToast(data.message, "success");
-        await loadDevices();  // Refresh table to show new status
-      } else {
-        showToast(data.message || "Action failed.", "error");
-        btn.disabled    = false;
-        btn.textContent = action === "block" ? "🚫 Block" : "✅ Unblock";
-      }
-    } catch(e) {
-      showToast("Network error.", "error");
-      btn.disabled    = false;
-      btn.textContent = action === "block" ? "🚫 Block" : "✅ Unblock";
-    }
-  }
-
   // ── Manual scan trigger ───────────────────────────────────────────────────
 
   async function triggerScan() {
@@ -332,7 +265,7 @@
     const icon = document.getElementById("refresh-icon");
     const prog = document.getElementById("scan-progress");
 
-    btn.disabled        = true;
+    btn.disabled         = true;
     icon.style.animation = "spin 1s linear infinite";
     prog.classList.add("active");
 

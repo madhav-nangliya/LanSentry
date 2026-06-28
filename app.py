@@ -100,6 +100,7 @@ def add_security_headers(response):
     response.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
+        # Chart.js loaded from CDN (jsdelivr) — required for dashboard charts
         "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src https://fonts.gstatic.com; "
@@ -155,6 +156,11 @@ def alerts_page():
     return send_from_directory(TEMPLATE_DIR, "alerts.html")
 
 
+@app.route("/history")
+def history_page():
+    return send_from_directory(TEMPLATE_DIR, "history.html")
+
+
 # =============================================================================
 # SECTION 2 — DEVICE API
 # =============================================================================
@@ -178,40 +184,6 @@ def api_devices():
         if isinstance(d.get("last_seen"), datetime):
             d["last_seen"] = d["last_seen"].isoformat()
     return jsonify({"success": True, "devices": devices, "count": len(devices)})
-
-
-@app.route("/api/devices/<mac>/block", methods=["POST"])
-def api_block_device(mac):
-    """
-    POST /api/devices/<mac>/block
-    Body: { "blocked": true } or { "blocked": false }
-
-    Why POST not GET?
-        GET is idempotent and may be cached. A cached "block" request could
-        silently do nothing. POST signals a state-changing action.
-
-    Why MAC not IP?
-        IPs change (DHCP). MAC is hardware-burned and stable.
-    """
-    data    = request.get_json(silent=True) or {}
-    blocked = bool(data.get("blocked", True))
-    success = db.set_device_blocked(mac=mac.upper(), blocked=blocked)
-
-    if success:
-        action = "blocked" if blocked else "unblocked"
-        device = db.get_device_by_mac(mac.upper())
-        if device:
-            db.create_alert(
-                alert_type  = "blocked_attempt" if blocked else "new_device",
-                device_mac  = mac.upper(),
-                device_ip   = device.get("ip", ""),
-                device_name = device.get("hostname", "Unknown"),
-                message     = f"Admin {action}: {device.get('vendor','Unknown')} ({device.get('ip','')})",
-                severity    = "warning" if blocked else "info"
-            )
-        return jsonify({"success": True, "message": f"Device {action}", "mac": mac})
-
-    return jsonify({"success": False, "message": "Device not found"}), 404
 
 
 # =============================================================================
@@ -260,8 +232,8 @@ def api_chart_device_status():
     s = db.get_device_stats()
     return jsonify({
         "success": True,
-        "labels":  ["Online", "Offline", "Blocked"],
-        "data":    [s["online"], s["offline"], s["blocked"]],
+        "labels":  ["Online", "Offline", "High Risk"],
+        "data":    [s["online"], s["offline"], s["high_risk"]],
         "total":   s["total"],
     })
 
@@ -276,7 +248,6 @@ def api_chart_alerts():
         "days":            days,
         "labels":          [str(r["day"])                   for r in rows],
         "new_device":      [int(r["new_device"]      or 0) for r in rows],
-        "blocked_attempt": [int(r["blocked_attempt"] or 0) for r in rows],
         "device_offline":  [int(r["device_offline"]  or 0) for r in rows],
         "high_risk":       [int(r["high_risk"]        or 0) for r in rows],
     })
@@ -333,7 +304,25 @@ def api_mark_all_read():
 
 
 # =============================================================================
-# SECTION 6 — HEALTH CHECK
+# SECTION 6 — SCAN HISTORY API
+# =============================================================================
+
+@app.route("/api/scan-history")
+def api_scan_history():
+    """
+    GET /api/scan-history?limit=50
+    Returns paginated scan history records for the history page table.
+    """
+    limit   = max(1, min(request.args.get("limit", 50, type=int), 200))
+    records = db.get_scan_history(limit=limit)
+    for r in records:
+        if isinstance(r.get("scan_time"), datetime):
+            r["scan_time"] = r["scan_time"].isoformat()
+    return jsonify({"success": True, "records": records, "count": len(records)})
+
+
+# =============================================================================
+# SECTION 7 — HEALTH CHECK
 # =============================================================================
 
 @app.route("/api/status")
@@ -353,7 +342,7 @@ def api_status():
 
 
 # =============================================================================
-# SECTION 7 — ERROR HANDLERS
+# SECTION 8 — ERROR HANDLERS
 # =============================================================================
 
 @app.errorhandler(404)

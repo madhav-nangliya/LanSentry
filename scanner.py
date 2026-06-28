@@ -44,7 +44,6 @@ from database import (
     get_all_devices,
     save_scan_result,
     create_alert,
-    get_device_by_mac,
 )
 
 logger = logging.getLogger("scanner")
@@ -279,7 +278,7 @@ def run_scan(subnet=None):
       5.  Merge nmap results with ARP cache
       6.  Upsert every device to DB
       7.  Mark absent devices offline
-      8.  Create alerts (new device, blocked, offline)
+      8.  Create alerts (new device, offline)
       9.  Save scan summary to scan_history
       10. Update in-memory cache
     """
@@ -408,19 +407,6 @@ def run_scan(subnet=None):
                     severity    = "warning" if risk in ("medium", "high") else "info"
                 )
                 logger.info("New device: %s | %s | %s | risk=%s", mac, ip, vendor, risk)
-
-            # Alert: blocked device appeared on network
-            db_dev = get_device_by_mac(mac)
-            if db_dev and db_dev.get("is_blocked"):
-                create_alert(
-                    alert_type  = "blocked_attempt",
-                    device_mac  = mac,
-                    device_ip   = ip,
-                    device_name = hostname if hostname != "Unknown" else vendor,
-                    message     = f"BLOCKED device on network: {vendor} ({ip})",
-                    severity    = "critical"
-                )
-                logger.warning("Blocked device detected: %s (%s)", mac, ip)
 
         # ── Step 7: Mark absent devices offline ──
         mark_devices_offline(active_macs)

@@ -1,111 +1,239 @@
-{% extends "base.html" %}
-
-{% block title %}Scan History — LanSentry{% endblock %}
-
-{% block content %}
+<!DOCTYPE html>
 <!--
   history.html — LanSentry Scan History
-  =======================================
-  Shows a paginated table of every completed scan stored in the
-  'scan_history' table: timestamp, devices found, new devices, duration.
-
-  This page was missing (nav link returned 404). Now it's a real page.
+  ════════════════════════════════════════════════════════════════
+  No Jinja2. Scan records are fetched from GET /api/scan-history
+  and rendered as a table by JavaScript after the page loads.
+  ════════════════════════════════════════════════════════════════
 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scan History — LanSentry</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
 
-<div class="page-header">
-  <div>
-    <div class="breadcrumb">LanSentry / <span>History</span></div>
-    <h2>Scan History</h2>
-    <p>Every network scan recorded since LanSentry started</p>
-  </div>
-</div>
-
-<div class="panel">
-  <div class="panel-header">
-    <div class="panel-title">
-      <div class="dot"></div>
-      Scan Records
-      <span class="count-badge" id="history-count">–</span>
+  <!-- ── NAVBAR ── -->
+  <nav class="navbar">
+    <a class="navbar-brand" href="/">
+      <div class="logo-icon">🛡️</div>
+      <h1>Lan<span>Sentry</span></h1>
+    </a>
+    <ul class="nav-links">
+      <li><a href="/"        id="nav-home">🏠 Home</a></li>
+      <li><a href="/devices" id="nav-devices">📡 Devices</a></li>
+      <li><a href="/alerts"  id="nav-alerts">
+        🚨 Alerts
+        <span class="alert-badge" id="alert-badge" style="display:none">0</span>
+      </a></li>
+      <li><a href="/history" id="nav-history">📋 History</a></li>
+    </ul>
+    <div class="nav-right">
+      <div class="network-status">
+        <div class="status-dot"></div>
+        <span>Network Active</span>
+      </div>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">
+        <div class="toggle-knob" id="toggle-knob">🌙</div>
+      </button>
+      <button class="hamburger" id="hamburger" aria-label="Menu">
+        <span></span><span></span><span></span>
+      </button>
     </div>
-    <div class="panel-actions">
-      <select id="limit-select" onchange="loadHistory()" style="padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:var(--bg-card); color:var(--text-primary); font-family:inherit;">
-        <option value="25">Last 25</option>
-        <option value="50" selected>Last 50</option>
-        <option value="100">Last 100</option>
-      </select>
+  </nav>
+  <div class="mobile-nav" id="mobile-nav">
+    <a href="/">🏠 Home</a>
+    <a href="/devices">📡 Devices</a>
+    <a href="/alerts">🚨 Alerts</a>
+    <a href="/history">📋 History</a>
+  </div>
+
+  <!-- ── MAIN CONTENT ── -->
+  <div class="container">
+
+    <div class="page-header">
+      <div class="breadcrumb">LanSentry / <span>History</span></div>
+      <h2>Scan History</h2>
+      <p>Every network scan recorded since LanSentry started</p>
     </div>
-  </div>
 
-  <div class="table-wrapper">
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Scan Time</th>
-          <th>Subnet</th>
-          <th>Devices Found</th>
-          <th>New Devices</th>
-          <th>Duration</th>
-        </tr>
-      </thead>
-      <tbody id="history-tbody">
-        <tr><td colspan="6"><div class="empty-state"><div class="empty-icon">⏳</div><p>Loading…</p></div></td></tr>
-      </tbody>
-    </table>
-  </div>
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <div class="dot"></div>
+          Scan Records
+        </div>
+        <div class="panel-actions">
+          <select id="limit-select" onchange="loadHistory()"
+                  style="padding:6px 10px; border-radius:8px; border:1px solid var(--border);
+                         background:var(--bg-card); color:var(--text-primary); font-family:inherit;">
+            <option value="25">Last 25</option>
+            <option value="50" selected>Last 50</option>
+            <option value="100">Last 100</option>
+          </select>
+        </div>
+      </div>
 
-  <div class="panel-footer">
-    <div class="update-info">
-      <div class="live-dot"></div>
-      <span id="history-updated">Loading…</span>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Scan Time</th>
+              <th>Subnet</th>
+              <th>Devices Found</th>
+              <th>New Devices</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody id="history-tbody">
+            <tr><td colspan="6">
+              <div class="empty-state">
+                <div class="empty-icon">⏳</div>
+                <p>Loading…</p>
+              </div>
+            </td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel-footer">
+        <div class="update-info">
+          <div class="live-dot"></div>
+          <span id="history-updated">Loading…</span>
+        </div>
+        <span class="next-scan">Auto-refreshes every 60s</span>
+      </div>
     </div>
-  </div>
-</div>
-{% endblock %}
 
-{% block scripts %}
-<script>
-async function loadHistory() {
-  const limit = document.getElementById('limit-select').value;
-  try {
-    const res  = await fetch(`/api/scan-history?limit=${limit}`);
-    const data = await res.json();
+  </div><!-- /container -->
 
-    if (!data.success) throw new Error('API error');
+  <div class="toast-container" id="toast-container"></div>
 
-    document.getElementById('history-count').textContent = data.records.length;
+  <!-- ── JAVASCRIPT ── -->
+  <script>
+  // ── Global utilities ──────────────────────────────────────────────────────
 
-    const tbody = document.getElementById('history-tbody');
-    if (data.records.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">📡</div><p>No scan history yet.</p></div></td></tr>`;
-      return;
-    }
+  (function() {
+    if (localStorage.getItem("lansentry-theme") === "light")
+      document.body.classList.add("light-mode");
+  })();
 
-    tbody.innerHTML = data.records.map((r, i) => {
-      const dt  = new Date(r.scan_time);
-      const ts  = dt.toLocaleDateString() + ' ' + dt.toLocaleTimeString();
-      const dur = `${r.scan_duration.toFixed(1)}s`;
-      const newClass = r.new_devices > 0 ? 'style="color:var(--warning)"' : '';
-      return `
-        <tr>
+  function toggleTheme() {
+    document.body.classList.toggle("light-mode");
+    const isLight = document.body.classList.contains("light-mode");
+    document.getElementById("toggle-knob").textContent = isLight ? "☀️" : "🌙";
+    localStorage.setItem("lansentry-theme", isLight ? "light" : "dark");
+  }
+
+  function escapeHTML(str) {
+    if (str == null) return "";
+    const el = document.createElement("div");
+    el.textContent = String(str);
+    return el.innerHTML;
+  }
+
+  function showToast(msg, type = "info", duration = 3500) {
+    const icons = { success:"✅", error:"❌", info:"ℹ️", warning:"⚠️" };
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `<span>${icons[type]||"ℹ️"}</span><span>${escapeHTML(msg)}</span>`;
+    document.getElementById("toast-container").appendChild(toast);
+    setTimeout(() => {
+      toast.style.animation = "toastOut 0.3s ease forwards";
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
+
+  function updateAlertBadge() {
+    fetch("/api/alerts/unread-count")
+      .then(r => r.json())
+      .then(data => {
+        const badge = document.getElementById("alert-badge");
+        if (data.count > 0) {
+          badge.textContent   = data.count;
+          badge.style.display = "inline";
+        } else {
+          badge.style.display = "none";
+        }
+      }).catch(() => {});
+  }
+
+  // ── Load and render scan history ──────────────────────────────────────────
+
+  async function loadHistory() {
+    const limit = document.getElementById("limit-select").value;
+    try {
+      const res  = await fetch(`/api/scan-history?limit=${limit}`);
+      const data = await res.json();
+
+      if (!data.success) throw new Error("API error");
+
+      const tbody = document.getElementById("history-tbody");
+
+      if (data.records.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6">
+          <div class="empty-state">
+            <div class="empty-icon">📡</div>
+            <p>No scan history yet. Scans run automatically every 60 seconds.</p>
+          </div>
+        </td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = data.records.map((r, i) => {
+        const dt  = new Date(r.scan_time);
+        const ts  = dt.toLocaleDateString() + " " + dt.toLocaleTimeString();
+        const dur = `${parseFloat(r.scan_duration).toFixed(1)}s`;
+        const newStyle = r.new_devices > 0 ? `style="color:var(--warning);font-weight:700;"` : "";
+
+        return `<tr>
           <td class="td-mono" style="color:var(--text-muted)">${i + 1}</td>
           <td class="td-mono">${escapeHTML(ts)}</td>
-          <td class="td-mono">${escapeHTML(r.subnet || '—')}</td>
+          <td class="td-mono">${escapeHTML(r.subnet || "—")}</td>
           <td><strong>${r.devices_found}</strong></td>
-          <td ${newClass}>${r.new_devices > 0 ? '🆕 ' : ''}${r.new_devices}</td>
-          <td class="td-mono">${dur}</td>
+          <td ${newStyle}>${r.new_devices > 0 ? "🆕 " : ""}${r.new_devices}</td>
+          <td class="td-mono">${escapeHTML(dur)}</td>
         </tr>`;
-    }).join('');
+      }).join("");
 
-    document.getElementById('history-updated').textContent =
-      'Loaded at ' + new Date().toLocaleTimeString();
+      document.getElementById("history-updated").textContent =
+        `Loaded ${data.records.length} record(s) at ${new Date().toLocaleTimeString()}`;
 
-  } catch (err) {
-    document.getElementById('history-tbody').innerHTML =
-      `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">❌</div><p>Failed to load history.</p></div></td></tr>`;
+    } catch(err) {
+      document.getElementById("history-tbody").innerHTML =
+        `<tr><td colspan="6">
+          <div class="empty-state">
+            <div class="empty-icon">❌</div>
+            <p>Failed to load scan history. Is the server running?</p>
+          </div>
+        </td></tr>`;
+      showToast("Failed to load history.", "error");
+    }
   }
-}
 
-loadHistory();
-</script>
-{% endblock %}
+  // ── Init ──────────────────────────────────────────────────────────────────
+
+  document.addEventListener("DOMContentLoaded", () => {
+    if (document.body.classList.contains("light-mode"))
+      document.getElementById("toggle-knob").textContent = "☀️";
+
+    document.getElementById("nav-history").classList.add("active");
+
+    document.getElementById("hamburger").addEventListener("click", () =>
+      document.getElementById("mobile-nav").classList.toggle("open")
+    );
+
+    updateAlertBadge();
+    setInterval(updateAlertBadge, 30_000);
+
+    loadHistory();
+    // Auto-refresh every 60s (each scan adds a row)
+    setInterval(loadHistory, 60_000);
+  });
+  </script>
+
+</body>
+</html>
